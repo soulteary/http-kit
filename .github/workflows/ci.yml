@@ -103,7 +103,9 @@ jobs:
       - name: Temporarily modify go.mod to match golangci-lint's Go version
         run: |
           cp go.mod go.mod.backup
+          cp go.sum go.sum.backup
           sed -i 's/^go 1\.25.*$/go 1.24/' go.mod
+          go mod tidy
 
       - name: Run golangci-lint
         uses: golangci/golangci-lint-action@v7
@@ -112,10 +114,11 @@ jobs:
           args: --timeout=5m
           only-new-issues: false
 
-      - name: Restore go.mod
+      - name: Restore go.mod and go.sum
         if: always()
         run: |
           mv go.mod.backup go.mod
+          mv go.sum.backup go.sum
 
   # Dependency security scan
   security-scan:
