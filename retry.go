@@ -113,9 +113,9 @@ func (c *Client) DoRequestWithRetry(ctx context.Context, req *http.Request, retr
 		return resp, nil
 	}
 
-	// This should only be reached if maxAttempts is 0 (MaxRetries = -1)
+	// This is only reached if maxAttempts is 0 (MaxRetries = -1)
 	if lastErr != nil {
-		return nil, fmt.Errorf("request failed: %w", lastErr)
+		return nil, fmt.Errorf("failed after retries: %w", lastErr)
 	}
 	return nil, fmt.Errorf("no attempts made")
 }

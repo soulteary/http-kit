@@ -467,6 +467,49 @@ func TestDoRequestWithRetry(t *testing.T) {
 	})
 }
 
+func TestRetryOptionsCalculateRetryDelayEdgeCases(t *testing.T) {
+	t.Run("zero backoff multiplier", func(t *testing.T) {
+		opts := &RetryOptions{
+			RetryDelay:        100 * time.Millisecond,
+			MaxRetryDelay:     2 * time.Second,
+			BackoffMultiplier: 0,
+		}
+
+		delay := opts.CalculateRetryDelay(0)
+		if delay != 0 {
+			t.Errorf("expected delay to be 0, got %v", delay)
+		}
+	})
+
+	t.Run("very large attempt number", func(t *testing.T) {
+		opts := &RetryOptions{
+			RetryDelay:        100 * time.Millisecond,
+			MaxRetryDelay:     1 * time.Second,
+			BackoffMultiplier: 2.0,
+		}
+
+		// Large attempt should be capped at MaxRetryDelay
+		delay := opts.CalculateRetryDelay(1000)
+		if delay != 1*time.Second {
+			t.Errorf("expected delay to be capped at 1s, got %v", delay)
+		}
+	})
+
+	t.Run("zero max retry delay", func(t *testing.T) {
+		opts := &RetryOptions{
+			RetryDelay:        100 * time.Millisecond,
+			MaxRetryDelay:     0,
+			BackoffMultiplier: 2.0,
+		}
+
+		delay := opts.CalculateRetryDelay(0)
+		// Any positive delay should be capped to 0
+		if delay != 0 {
+			t.Errorf("expected delay to be 0, got %v", delay)
+		}
+	})
+}
+
 func TestDoRequestWithRetryEdgeCases(t *testing.T) {
 	t.Run("retry with successful response after retryable errors", func(t *testing.T) {
 		var requestCount int32
@@ -693,4 +736,163 @@ func TestDoRequestWithRetryEdgeCases(t *testing.T) {
 			t.Errorf("expected 0 requests, got %d", requestCount)
 		}
 	})
+
+	t.Run("context deadline exceeded during delay", func(t *testing.T) {
+		var requestCount int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&requestCount, 1)
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}))
+		defer server.Close()
+
+		client, err := NewClient(&Options{BaseURL: server.URL})
+		if err != nil {
+			t.Fatalf("failed to create client: %v", err)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+
+		req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
+		retryOpts := &RetryOptions{
+			MaxRetries:           5,
+			RetryDelay:           200 * time.Millisecond, // Longer than context timeout
+			MaxRetryDelay:        1 * time.Second,
+			BackoffMultiplier:    1.0,
+			RetryableStatusCodes: []int{http.StatusServiceUnavailable},
+		}
+
+		_, err = client.DoRequestWithRetry(ctx, req, retryOpts)
+		if err == nil {
+			t.Error("expected error due to context deadline")
+		}
+
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("expected context.DeadlineExceeded error, got %v", err)
+		}
+	})
+
+	t.Run("multiple retryable status codes", func(t *testing.T) {
+		var requestCount int32
+		statusCodes := []int{
+			http.StatusServiceUnavailable,
+			http.StatusBadGateway,
+			http.StatusOK,
+		}
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			count := int(atomic.AddInt32(&requestCount, 1))
+			if count <= len(statusCodes) {
+				w.WriteHeader(statusCodes[count-1])
+			} else {
+				w.WriteHeader(http.StatusOK)
+			}
+		}))
+		defer server.Close()
+
+		client, err := NewClient(&Options{BaseURL: server.URL})
+		if err != nil {
+			t.Fatalf("failed to create client: %v", err)
+		}
+
+		req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
+		retryOpts := &RetryOptions{
+			MaxRetries:           5,
+			RetryDelay:           1 * time.Millisecond,
+			MaxRetryDelay:        10 * time.Millisecond,
+			BackoffMultiplier:    1.0,
+			RetryableStatusCodes: []int{http.StatusServiceUnavailable, http.StatusBadGateway},
+		}
+
+		resp, err := client.DoRequestWithRetry(context.Background(), req, retryOpts)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("expected status 200, got %d", resp.StatusCode)
+		}
+
+		if atomic.LoadInt32(&requestCount) != 3 {
+			t.Errorf("expected 3 requests, got %d", requestCount)
+		}
+	})
+}
+
+// Benchmarks
+
+func BenchmarkIsRetryableError(b *testing.B) {
+	opts := DefaultRetryOptions()
+
+	b.Run("with error", func(b *testing.B) {
+		err := errors.New("connection refused")
+		for i := 0; i < b.N; i++ {
+			opts.IsRetryableError(err, 0)
+		}
+	})
+
+	b.Run("with retryable status code", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			opts.IsRetryableError(nil, http.StatusServiceUnavailable)
+		}
+	})
+
+	b.Run("with non-retryable status code", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			opts.IsRetryableError(nil, http.StatusBadRequest)
+		}
+	})
+}
+
+func BenchmarkCalculateRetryDelay(b *testing.B) {
+	opts := DefaultRetryOptions()
+
+	b.Run("first attempt", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			opts.CalculateRetryDelay(0)
+		}
+	})
+
+	b.Run("third attempt", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			opts.CalculateRetryDelay(2)
+		}
+	})
+
+	b.Run("capped delay", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			opts.CalculateRetryDelay(100)
+		}
+	})
+}
+
+func BenchmarkDoRequestWithRetry(b *testing.B) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client, err := NewClient(&Options{BaseURL: server.URL})
+	if err != nil {
+		b.Fatalf("failed to create client: %v", err)
+	}
+
+	retryOpts := &RetryOptions{
+		MaxRetries:           3,
+		RetryDelay:           1 * time.Millisecond,
+		MaxRetryDelay:        10 * time.Millisecond,
+		BackoffMultiplier:    2.0,
+		RetryableStatusCodes: []int{http.StatusServiceUnavailable},
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
+		resp, err := client.DoRequestWithRetry(context.Background(), req, retryOpts)
+		if err != nil {
+			b.Fatalf("unexpected error: %v", err)
+		}
+		_ = resp.Body.Close()
+	}
 }

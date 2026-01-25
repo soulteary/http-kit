@@ -464,14 +464,40 @@ func TestClientInjectTraceContext(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	req, _ := http.NewRequest(http.MethodGet, "http://example.com", nil)
-	ctx := context.Background()
+	t.Run("without active span", func(t *testing.T) {
+		req, _ := http.NewRequest(http.MethodGet, "http://example.com", nil)
+		ctx := context.Background()
 
-	// This should not panic even without active span
-	client.InjectTraceContext(ctx, req)
+		// This should not panic even without active span
+		client.InjectTraceContext(ctx, req)
 
-	// The traceparent header might not be set without an active span,
-	// but the function should complete without error
+		// The traceparent header might not be set without an active span,
+		// but the function should complete without error
+	})
+
+	t.Run("with trace context in request", func(t *testing.T) {
+		req, _ := http.NewRequest(http.MethodGet, "http://example.com", nil)
+		ctx := context.Background()
+
+		// Inject trace context
+		client.InjectTraceContext(ctx, req)
+
+		// Verify the function completed without error
+		// Headers may or may not be set depending on tracer state
+	})
+
+	t.Run("preserves existing headers", func(t *testing.T) {
+		req, _ := http.NewRequest(http.MethodGet, "http://example.com", nil)
+		req.Header.Set("X-Custom-Header", "custom-value")
+		ctx := context.Background()
+
+		client.InjectTraceContext(ctx, req)
+
+		// Verify existing headers are preserved
+		if req.Header.Get("X-Custom-Header") != "custom-value" {
+			t.Error("expected existing header to be preserved")
+		}
+	})
 }
 
 func TestClientGetBaseURL(t *testing.T) {
@@ -503,5 +529,282 @@ func TestClientGetHTTPClient(t *testing.T) {
 
 	if httpClient.Timeout != 15*time.Second {
 		t.Errorf("expected timeout to be 15s, got %v", httpClient.Timeout)
+	}
+}
+
+func TestNewClientEdgeCases(t *testing.T) {
+	t.Run("with both CA cert and InsecureSkipVerify", func(t *testing.T) {
+		// Create a temporary directory for test certificates
+		tempDir, err := os.MkdirTemp("", "httpkit-test")
+		if err != nil {
+			t.Fatalf("failed to create temp dir: %v", err)
+		}
+		defer func() { _ = os.RemoveAll(tempDir) }()
+
+		// Generate a self-signed CA certificate
+		caKey, err := rsa.GenerateKey(rand.Reader, 2048)
+		if err != nil {
+			t.Fatalf("failed to generate CA key: %v", err)
+		}
+
+		caTemplate := &x509.Certificate{
+			SerialNumber: big.NewInt(1),
+			Subject: pkix.Name{
+				Organization: []string{"Test CA"},
+			},
+			NotBefore:             time.Now(),
+			NotAfter:              time.Now().Add(24 * time.Hour),
+			KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+			BasicConstraintsValid: true,
+			IsCA:                  true,
+		}
+
+		caCertDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
+		if err != nil {
+			t.Fatalf("failed to create CA certificate: %v", err)
+		}
+
+		caCertFile := filepath.Join(tempDir, "ca.crt")
+		caCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caCertDER})
+		if err := os.WriteFile(caCertFile, caCertPEM, 0600); err != nil {
+			t.Fatalf("failed to write CA certificate: %v", err)
+		}
+
+		opts := &Options{
+			BaseURL:            "https://example.com",
+			TLSCACertFile:      caCertFile,
+			InsecureSkipVerify: true,
+			TLSServerName:      "test.example.com",
+		}
+
+		client, err := NewClient(opts)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		transport, ok := client.GetHTTPClient().Transport.(*http.Transport)
+		if !ok {
+			t.Fatal("expected transport to be *http.Transport")
+		}
+
+		if transport.TLSClientConfig == nil {
+			t.Fatal("expected TLSClientConfig to be set")
+		}
+
+		// Both RootCAs and InsecureSkipVerify should be set
+		if transport.TLSClientConfig.RootCAs == nil {
+			t.Error("expected RootCAs to be set")
+		}
+		if !transport.TLSClientConfig.InsecureSkipVerify {
+			t.Error("expected InsecureSkipVerify to be true")
+		}
+		if transport.TLSClientConfig.ServerName != "test.example.com" {
+			t.Errorf("expected ServerName to be test.example.com, got %s", transport.TLSClientConfig.ServerName)
+		}
+	})
+
+	t.Run("with zero timeout", func(t *testing.T) {
+		opts := &Options{
+			BaseURL: "http://example.com",
+			Timeout: 0,
+		}
+
+		client, err := NewClient(opts)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if client.GetHTTPClient().Timeout != 0 {
+			t.Errorf("expected timeout to be 0, got %v", client.GetHTTPClient().Timeout)
+		}
+	})
+
+	t.Run("with empty user agent", func(t *testing.T) {
+		opts := &Options{
+			BaseURL:   "http://example.com",
+			UserAgent: "",
+		}
+
+		client, err := NewClient(opts)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if client.userAgent != "" {
+			t.Errorf("expected userAgent to be empty, got %s", client.userAgent)
+		}
+	})
+}
+
+func TestClientDoWithDifferentMethods(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Method", r.Method)
+		w.Header().Set("X-Content-Type", r.Header.Get("Content-Type"))
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client, err := NewClient(&Options{
+		BaseURL: server.URL,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	methods := []string{
+		http.MethodGet,
+		http.MethodPost,
+		http.MethodPut,
+		http.MethodPatch,
+		http.MethodDelete,
+		http.MethodHead,
+		http.MethodOptions,
+	}
+
+	for _, method := range methods {
+		t.Run(method, func(t *testing.T) {
+			req, _ := http.NewRequest(method, server.URL, nil)
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+
+			if resp.Header.Get("X-Method") != method {
+				t.Errorf("expected method %s, got %s", method, resp.Header.Get("X-Method"))
+			}
+		})
+	}
+}
+
+func TestClientDoWithHeaders(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Echo back all headers with X- prefix
+		for key, values := range r.Header {
+			for _, value := range values {
+				w.Header().Add("X-Echo-"+key, value)
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client, err := NewClient(&Options{
+		BaseURL:   server.URL,
+		UserAgent: "test-agent/1.0",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	t.Run("with custom headers", func(t *testing.T) {
+		req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
+		req.Header.Set("X-Custom-Header", "custom-value")
+		req.Header.Set("Authorization", "Bearer token123")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		if resp.Header.Get("X-Echo-X-Custom-Header") != "custom-value" {
+			t.Error("expected custom header to be echoed")
+		}
+		if resp.Header.Get("X-Echo-Authorization") != "Bearer token123" {
+			t.Error("expected authorization header to be echoed")
+		}
+	})
+
+	t.Run("with multiple values for same header", func(t *testing.T) {
+		req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
+		req.Header.Add("X-Multi", "value1")
+		req.Header.Add("X-Multi", "value2")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("expected status 200, got %d", resp.StatusCode)
+		}
+	})
+}
+
+// Benchmarks
+
+func BenchmarkNewClient(b *testing.B) {
+	opts := &Options{
+		BaseURL:   "http://example.com",
+		Timeout:   10 * time.Second,
+		UserAgent: "test-agent/1.0",
+	}
+
+	for i := 0; i < b.N; i++ {
+		_, err := NewClient(opts)
+		if err != nil {
+			b.Fatalf("unexpected error: %v", err)
+		}
+	}
+}
+
+func BenchmarkClientDo(b *testing.B) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client, err := NewClient(&Options{
+		BaseURL:   server.URL,
+		UserAgent: "bench-agent/1.0",
+	})
+	if err != nil {
+		b.Fatalf("unexpected error: %v", err)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
+		resp, err := client.Do(req)
+		if err != nil {
+			b.Fatalf("unexpected error: %v", err)
+		}
+		_ = resp.Body.Close()
+	}
+}
+
+func BenchmarkInjectTraceContext(b *testing.B) {
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	))
+
+	client, err := NewClient(&Options{
+		BaseURL: "http://example.com",
+	})
+	if err != nil {
+		b.Fatalf("unexpected error: %v", err)
+	}
+
+	ctx := context.Background()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		req, _ := http.NewRequest(http.MethodGet, "http://example.com", nil)
+		client.InjectTraceContext(ctx, req)
+	}
+}
+
+func BenchmarkOptionsValidate(b *testing.B) {
+	opts := &Options{
+		BaseURL:   "http://example.com",
+		Timeout:   10 * time.Second,
+		UserAgent: "test-agent/1.0",
+	}
+
+	for i := 0; i < b.N; i++ {
+		_ = opts.Validate()
 	}
 }
