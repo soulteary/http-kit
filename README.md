@@ -184,7 +184,7 @@ go tool cover -func=coverage.out
 
 ## Requirements
 
-- Go 1.21 or later
+- Go 1.26 or later
 
 ## License
 

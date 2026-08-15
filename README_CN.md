@@ -184,7 +184,7 @@ go tool cover -func=coverage.out
 
 ## 环境要求
 
-- Go 1.21 或更高版本
+- Go 1.26 或更高版本
 
 ## 许可证
 
