@@ -1,6 +1,6 @@
 module github.com/soulteary/http-kit
 
-go 1.26.6
+go 1.27.0
 
 require go.opentelemetry.io/otel v1.46.0
 
