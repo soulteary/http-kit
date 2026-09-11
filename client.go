@@ -56,7 +56,7 @@ func (o *Options) Validate() error {
 	// never being presented, with no error anywhere, so the conflict is
 	// reported instead. Configure TLS on the Transport itself.
 	if o.Transport != nil && o.hasTLSSettings() {
-		return fmt.Errorf("Transport and TLS options are mutually exclusive: configure TLS on the Transport itself")
+		return fmt.Errorf("transport and TLS options are mutually exclusive: configure TLS on the Transport itself")
 	}
 	if (o.TLSClientCert == "") != (o.TLSClientKey == "") {
 		return fmt.Errorf("TLSClientCert and TLSClientKey must be set together")
