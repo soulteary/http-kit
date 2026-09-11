@@ -81,21 +81,14 @@ func (r *RetryOptions) IsRetryableErrorCtx(ctx context.Context, err error, statu
 	return false
 }
 
-// isTransientError reports whether err is worth another attempt.
+// isTransientErrorCtx reports whether err is worth another attempt.
 //
-// Only the CALLER giving up suppresses retries. http.Client.Timeout is a
-// per-attempt limit, and it surfaces as a *url.Error wrapping
-// context.DeadlineExceeded exactly like an expired request context -- so
-// classifying every DeadlineExceeded as permanent made one slow first attempt
-// fail the whole call, even where a second attempt would have succeeded. Use
-// isTransientErrorCtx where the caller's context is available; this form
-// assumes it is still live.
-func isTransientError(err error) bool {
-	return isTransientErrorCtx(context.Background(), err)
-}
-
-// isTransientErrorCtx is isTransientError with the caller's context, whose
-// cancellation or expiry is the one deadline that ends the call.
+// Only the CALLER giving up suppresses retries, which is why the caller's
+// context is a parameter: http.Client.Timeout is a PER-ATTEMPT limit and
+// surfaces as a *url.Error wrapping context.DeadlineExceeded exactly like an
+// expired request context. Classifying every DeadlineExceeded as permanent
+// therefore made one slow first attempt fail the whole call, even where a
+// second attempt would have succeeded.
 func isTransientErrorCtx(ctx context.Context, err error) bool {
 	// The caller gave up, or the caller's own deadline passed.
 	if ctx != nil && ctx.Err() != nil {
