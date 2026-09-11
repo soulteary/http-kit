@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"time"
@@ -114,16 +115,7 @@ func NewClient(opts *Options) (*Client, error) {
 	if opts.Transport != nil {
 		httpClient.Transport = opts.Transport
 	} else if tlsConfig != nil {
-		// Clone the standard transport rather than building a bare one.
-		// A zero-value http.Transport has no Proxy (so HTTPS_PROXY stops
-		// working), no ForceAttemptHTTP2, and default connection-pool limits
-		// of 2 idle connections per host -- configuring TLS should not
-		// silently cost all of that.
-		transport, ok := http.DefaultTransport.(*http.Transport)
-		if !ok {
-			return nil, fmt.Errorf("http.DefaultTransport is not an *http.Transport")
-		}
-		transport = transport.Clone()
+		transport := standardTransport()
 		transport.TLSClientConfig = tlsConfig
 		httpClient.Transport = transport
 	}
@@ -133,6 +125,34 @@ func NewClient(opts *Options) (*Client, error) {
 		baseURL:    opts.BaseURL,
 		userAgent:  opts.UserAgent,
 	}, nil
+}
+
+// standardTransport returns an *http.Transport carrying the standard library's
+// defaults, ready to have TLSClientConfig set on it.
+//
+// A zero-value http.Transport has no Proxy (so HTTPS_PROXY stops working), no
+// ForceAttemptHTTP2, and a pool limit of 2 idle connections per host --
+// configuring TLS should not silently cost all of that, so the defaults are
+// taken from http.DefaultTransport when it still is one. That is a mutable
+// package-level variable, though: an application that replaces it with a
+// tracing or metrics wrapper must not thereby lose the ability to build a TLS
+// client, so the same defaults are reconstructed when the assertion fails.
+func standardTransport() *http.Transport {
+	if t, ok := http.DefaultTransport.(*http.Transport); ok {
+		return t.Clone()
+	}
+	return &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
 }
 
 // Do performs an HTTP request

@@ -139,24 +139,36 @@ func TestRetryCancelsWithContext(t *testing.T) {
 	}
 }
 
-// TestRetryHonoursRetryAfter checks the server's own backoff request wins.
-func TestRetryHonoursRetryAfter(t *testing.T) {
+// retryAfterServer answers the first request with the given Retry-After and a
+// 429, then succeeds.
+func retryAfterServer(t *testing.T, retryAfter string) *httptest.Server {
+	t.Helper()
 	var attempts int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		if atomic.AddInt32(&attempts, 1) == 1 {
-			w.Header().Set("Retry-After", "1")
+			w.Header().Set("Retry-After", retryAfter)
 			w.WriteHeader(http.StatusTooManyRequests)
 			return
 		}
 		w.WriteHeader(http.StatusOK)
 	}))
-	defer srv.Close()
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestRetryHonoursRetryAfter checks the server's own backoff request wins over
+// the computed backoff, up to the configured ceiling.
+func TestRetryHonoursRetryAfter(t *testing.T) {
+	srv := retryAfterServer(t, "1")
 
 	client, _ := NewClient(&Options{BaseURL: srv.URL, Timeout: 10 * time.Second})
 	req, _ := http.NewRequest(http.MethodGet, srv.URL, nil)
 
+	opts := fastRetryOpts(2)
+	opts.MaxRetryDelay = 2 * time.Second // room for the server's 1s
+
 	start := time.Now()
-	resp, err := client.DoRequestWithRetry(context.Background(), req, fastRetryOpts(2))
+	resp, err := client.DoRequestWithRetry(context.Background(), req, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,6 +176,90 @@ func TestRetryHonoursRetryAfter(t *testing.T) {
 
 	if elapsed := time.Since(start); elapsed < 900*time.Millisecond {
 		t.Errorf("waited %s, want at least the 1s the server asked for", elapsed)
+	}
+}
+
+// TestRetryAfterIsCappedByMaxRetryDelay is the regression test for a
+// server-supplied Retry-After bypassing MaxRetryDelay entirely. With a
+// background context, a server answering "Retry-After: 86400" suspended the
+// call for a day -- and http.Client.Timeout does not cover that sleep.
+func TestRetryAfterIsCappedByMaxRetryDelay(t *testing.T) {
+	srv := retryAfterServer(t, "86400")
+
+	client, _ := NewClient(&Options{BaseURL: srv.URL, Timeout: 10 * time.Second})
+	req, _ := http.NewRequest(http.MethodGet, srv.URL, nil)
+
+	opts := fastRetryOpts(2)
+	opts.MaxRetryDelay = 50 * time.Millisecond
+
+	start := time.Now()
+	resp, err := client.DoRequestWithRetry(context.Background(), req, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+
+	elapsed := time.Since(start)
+	if elapsed > 2*time.Second {
+		t.Errorf("waited %s for a Retry-After of 86400s; MaxRetryDelay (%s) must bound it", elapsed, opts.MaxRetryDelay)
+	}
+}
+
+// TestPerAttemptTimeoutIsRetried is the regression test for classifying
+// http.Client.Timeout as permanent. It surfaces as a *url.Error wrapping
+// context.DeadlineExceeded, exactly like an expired request context, so a
+// transiently slow first attempt failed the whole call even though a second
+// attempt would have succeeded.
+func TestPerAttemptTimeoutIsRetried(t *testing.T) {
+	var attempts int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if atomic.AddInt32(&attempts, 1) == 1 {
+			time.Sleep(400 * time.Millisecond) // outlives the client timeout
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	// Client timeout well under the server's first-attempt delay.
+	client, _ := NewClient(&Options{BaseURL: srv.URL, Timeout: 100 * time.Millisecond})
+	req, _ := http.NewRequest(http.MethodGet, srv.URL, nil)
+
+	resp, err := client.DoRequestWithRetry(context.Background(), req, fastRetryOpts(3))
+	if err != nil {
+		t.Fatalf("DoRequestWithRetry error = %v; a per-attempt client timeout must be retried", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	if got := atomic.LoadInt32(&attempts); got < 2 {
+		t.Errorf("attempts = %d, want the slow first attempt to be retried", got)
+	}
+}
+
+// TestCallerContextExpiryIsNotRetried: the caller's own deadline still ends the
+// call -- that is the one timeout retries must not paper over.
+func TestCallerContextExpiryIsNotRetried(t *testing.T) {
+	var attempts int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		time.Sleep(300 * time.Millisecond)
+	}))
+	defer srv.Close()
+
+	client, _ := NewClient(&Options{BaseURL: srv.URL, Timeout: 10 * time.Second})
+	req, _ := http.NewRequest(http.MethodGet, srv.URL, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	if _, err := client.DoRequestWithRetry(ctx, req, fastRetryOpts(3)); err == nil {
+		t.Fatal("DoRequestWithRetry returned nil error after the caller's context expired")
+	}
+	if got := atomic.LoadInt32(&attempts); got != 1 {
+		t.Errorf("attempts = %d, want 1: an expired caller context must not be retried", got)
 	}
 }
 

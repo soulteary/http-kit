@@ -56,12 +56,19 @@ func DefaultRetryOptions() *RetryOptions {
 // similar permanent errors used to be retried the full MaxRetries times: the
 // request could never succeed, so the only effect was to delay the failure.
 func (r *RetryOptions) IsRetryableError(err error, statusCode int) bool {
+	return r.IsRetryableErrorCtx(context.Background(), err, statusCode)
+}
+
+// IsRetryableErrorCtx is IsRetryableError with the caller's context, so a
+// per-attempt http.Client.Timeout can be told apart from the caller's own
+// deadline. Only the latter ends the call.
+func (r *RetryOptions) IsRetryableErrorCtx(ctx context.Context, err error, statusCode int) bool {
 	if r.MaxRetries == 0 {
 		return false
 	}
 
 	if err != nil {
-		return isTransientError(err)
+		return isTransientErrorCtx(ctx, err)
 	}
 
 	// Check if status code is in retryable list
@@ -75,10 +82,38 @@ func (r *RetryOptions) IsRetryableError(err error, statusCode int) bool {
 }
 
 // isTransientError reports whether err is worth another attempt.
+//
+// Only the CALLER giving up suppresses retries. http.Client.Timeout is a
+// per-attempt limit, and it surfaces as a *url.Error wrapping
+// context.DeadlineExceeded exactly like an expired request context -- so
+// classifying every DeadlineExceeded as permanent made one slow first attempt
+// fail the whole call, even where a second attempt would have succeeded. Use
+// isTransientErrorCtx where the caller's context is available; this form
+// assumes it is still live.
 func isTransientError(err error) bool {
-	// The caller gave up, or the deadline passed: nothing to retry.
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	return isTransientErrorCtx(context.Background(), err)
+}
+
+// isTransientErrorCtx is isTransientError with the caller's context, whose
+// cancellation or expiry is the one deadline that ends the call.
+func isTransientErrorCtx(ctx context.Context, err error) bool {
+	// The caller gave up, or the caller's own deadline passed.
+	if ctx != nil && ctx.Err() != nil {
 		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		// Reaching here means the caller's own context is still live, so this
+		// deadline belongs to a single attempt. A *url.Error says the HTTP
+		// client reported it -- http.Client.Timeout -- and a transiently slow
+		// attempt is worth retrying. A bare sentinel says nothing about
+		// whether another attempt would differ, so it stays permanent.
+		var urlErr *url.Error
+		if !errors.As(err, &urlErr) {
+			return false
+		}
 	}
 
 	// TLS verification failed: the same certificate will fail again.
@@ -248,7 +283,14 @@ func (c *Client) DoRequestWithRetry(ctx context.Context, req *http.Request, retr
 
 			delay := jitter(retryOpts.CalculateRetryDelay(attempt - 1))
 			if lastRetryAfter > 0 {
+				// Honour Retry-After, but never past the configured ceiling.
+				// http.Client.Timeout does not cover this sleep, so an
+				// unbounded value let a server returning "Retry-After: 86400"
+				// suspend the call for a day.
 				delay = lastRetryAfter
+				if retryOpts.MaxRetryDelay > 0 && delay > retryOpts.MaxRetryDelay {
+					delay = retryOpts.MaxRetryDelay
+				}
 			}
 
 			select {
@@ -262,7 +304,10 @@ func (c *Client) DoRequestWithRetry(ctx context.Context, req *http.Request, retr
 		resp, err := c.Do(req)
 		if err != nil {
 			lastErr = err
-			if !replayable || !retryOpts.IsRetryableError(err, 0) {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, fmt.Errorf("failed to execute request: %w", err)
+			}
+			if !replayable || !retryOpts.IsRetryableErrorCtx(ctx, err, 0) {
 				return nil, fmt.Errorf("failed to execute request: %w", err)
 			}
 			if attempt >= retryOpts.MaxRetries {
