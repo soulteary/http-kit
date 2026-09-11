@@ -148,7 +148,7 @@ func TestRetryOptionsCalculateRetryDelay(t *testing.T) {
 				BackoffMultiplier: 2.0,
 			},
 			attempt: 0,
-			want:    200 * time.Millisecond, // 100ms * 1 * 2.0
+			want:    100 * time.Millisecond, // 100ms * 2.0^0
 		},
 		{
 			name: "second attempt",
@@ -158,7 +158,7 @@ func TestRetryOptionsCalculateRetryDelay(t *testing.T) {
 				BackoffMultiplier: 2.0,
 			},
 			attempt: 1,
-			want:    400 * time.Millisecond, // 100ms * 2 * 2.0
+			want:    200 * time.Millisecond, // 100ms * 2.0^1
 		},
 		{
 			name: "third attempt",
@@ -168,7 +168,7 @@ func TestRetryOptionsCalculateRetryDelay(t *testing.T) {
 				BackoffMultiplier: 2.0,
 			},
 			attempt: 2,
-			want:    600 * time.Millisecond, // 100ms * 3 * 2.0
+			want:    400 * time.Millisecond, // 100ms * 2.0^2
 		},
 		{
 			name: "exceeds max delay",
@@ -188,7 +188,7 @@ func TestRetryOptionsCalculateRetryDelay(t *testing.T) {
 				BackoffMultiplier: 1.0,
 			},
 			attempt: 2,
-			want:    300 * time.Millisecond, // 100ms * 3 * 1.0
+			want:    100 * time.Millisecond, // 100ms * 1.0^2 -- a multiplier of 1 means no growth
 		},
 	}
 
@@ -475,9 +475,11 @@ func TestRetryOptionsCalculateRetryDelayEdgeCases(t *testing.T) {
 			BackoffMultiplier: 0,
 		}
 
+		// A multiplier below 1 would shrink the delay towards zero and hammer
+		// the server, so it is treated as "no growth" rather than "no delay".
 		delay := opts.CalculateRetryDelay(0)
-		if delay != 0 {
-			t.Errorf("expected delay to be 0, got %v", delay)
+		if delay != 100*time.Millisecond {
+			t.Errorf("expected delay to fall back to RetryDelay, got %v", delay)
 		}
 	})
 

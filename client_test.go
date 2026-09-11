@@ -353,15 +353,45 @@ func TestNewClientWithClientCert(t *testing.T) {
 		}
 	})
 
-	t.Run("missing client key", func(t *testing.T) {
-		// When only cert is provided without key, TLS config is created but no certificates loaded
+	// Half-configured mTLS used to build a TLS config with no client
+	// certificate in it, so the client silently failed to present one. That is
+	// a configuration mistake and is now reported.
+	t.Run("missing client key is rejected", func(t *testing.T) {
 		opts := &Options{
 			BaseURL:       "https://example.com",
 			TLSClientCert: clientCertFile,
 			// TLSClientKey is empty
 		}
 
-		client, err := NewClient(opts)
+		if _, err := NewClient(opts); err == nil {
+			t.Error("expected an error when TLSClientCert is set without TLSClientKey")
+		}
+	})
+
+	// A caller-supplied Transport carries its own TLS configuration, so
+	// combining the two silently dropped the TLS options -- including an mTLS
+	// client certificate.
+	t.Run("Transport together with TLS options is rejected", func(t *testing.T) {
+		opts := &Options{
+			BaseURL:       "https://example.com",
+			Transport:     http.DefaultTransport,
+			TLSClientCert: clientCertFile,
+			TLSClientKey:  clientKeyFile,
+		}
+
+		if _, err := NewClient(opts); err == nil {
+			t.Error("expected an error when Transport and TLS options are combined")
+		}
+	})
+
+	// Configuring TLS must not cost proxy support, HTTP/2 or the standard
+	// connection-pool limits.
+	t.Run("TLS transport keeps the standard transport settings", func(t *testing.T) {
+		client, err := NewClient(&Options{
+			BaseURL:       "https://example.com",
+			TLSClientCert: clientCertFile,
+			TLSClientKey:  clientKeyFile,
+		})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -370,10 +400,17 @@ func TestNewClientWithClientCert(t *testing.T) {
 		if !ok {
 			t.Fatal("expected transport to be *http.Transport")
 		}
-
-		// With only cert and no key, certificates should not be loaded
-		if len(transport.TLSClientConfig.Certificates) != 0 {
-			t.Error("expected no client certificates when key is missing")
+		if transport.Proxy == nil {
+			t.Error("Proxy is nil: HTTPS_PROXY would be ignored")
+		}
+		if !transport.ForceAttemptHTTP2 {
+			t.Error("ForceAttemptHTTP2 is false: HTTP/2 would not be negotiated")
+		}
+		if transport.MaxIdleConns == 0 {
+			t.Error("MaxIdleConns is 0: the standard pool limits were lost")
+		}
+		if transport.TLSClientConfig == nil || len(transport.TLSClientConfig.Certificates) == 0 {
+			t.Error("the configured client certificate was not applied")
 		}
 	})
 }

@@ -40,10 +40,26 @@ func DefaultOptions() *Options {
 	}
 }
 
+// hasTLSSettings reports whether any TLS-related option was set.
+func (o *Options) hasTLSSettings() bool {
+	return o.TLSCACertFile != "" || o.TLSClientCert != "" || o.TLSClientKey != "" ||
+		o.TLSServerName != "" || o.InsecureSkipVerify
+}
+
 // Validate validates the options
 func (o *Options) Validate() error {
 	if o.BaseURL == "" {
 		return fmt.Errorf("base URL is required")
+	}
+	// A caller-supplied Transport carries its own TLS configuration. Silently
+	// dropping the TLS options here is how an mTLS client certificate ends up
+	// never being presented, with no error anywhere, so the conflict is
+	// reported instead. Configure TLS on the Transport itself.
+	if o.Transport != nil && o.hasTLSSettings() {
+		return fmt.Errorf("Transport and TLS options are mutually exclusive: configure TLS on the Transport itself")
+	}
+	if (o.TLSClientCert == "") != (o.TLSClientKey == "") {
+		return fmt.Errorf("TLSClientCert and TLSClientKey must be set together")
 	}
 	return nil
 }
@@ -60,9 +76,10 @@ func NewClient(opts *Options) (*Client, error) {
 
 	// Configure TLS
 	var tlsConfig *tls.Config
-	if opts.TLSCACertFile != "" || opts.TLSClientCert != "" || opts.InsecureSkipVerify {
+	if opts.hasTLSSettings() {
 		tlsConfig = &tls.Config{
-			InsecureSkipVerify: opts.InsecureSkipVerify,
+			MinVersion:         tls.VersionTLS12,
+			InsecureSkipVerify: opts.InsecureSkipVerify, //nolint:gosec // opt-in, documented as not recommended
 			ServerName:         opts.TLSServerName,
 		}
 
@@ -97,9 +114,18 @@ func NewClient(opts *Options) (*Client, error) {
 	if opts.Transport != nil {
 		httpClient.Transport = opts.Transport
 	} else if tlsConfig != nil {
-		httpClient.Transport = &http.Transport{
-			TLSClientConfig: tlsConfig,
+		// Clone the standard transport rather than building a bare one.
+		// A zero-value http.Transport has no Proxy (so HTTPS_PROXY stops
+		// working), no ForceAttemptHTTP2, and default connection-pool limits
+		// of 2 idle connections per host -- configuring TLS should not
+		// silently cost all of that.
+		transport, ok := http.DefaultTransport.(*http.Transport)
+		if !ok {
+			return nil, fmt.Errorf("http.DefaultTransport is not an *http.Transport")
 		}
+		transport = transport.Clone()
+		transport.TLSClientConfig = tlsConfig
+		httpClient.Transport = transport
 	}
 
 	return &Client{
