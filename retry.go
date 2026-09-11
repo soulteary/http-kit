@@ -22,6 +22,16 @@ import (
 // connection is returned to the pool.
 const drainLimit = 64 << 10
 
+// drainTimeout bounds how long that read may take.
+//
+// A byte ceiling alone does not bound time: a server can answer with a
+// retryable status and then trickle far fewer than drainLimit bytes, keeping
+// the read alive indefinitely. Nothing else stops it in that case -- a Client
+// with Timeout == 0 sets no read deadline, and a caller passing a non-expiring
+// context never cancels the transport -- so the retry loop would block forever
+// on a courtesy read.
+const drainTimeout = 2 * time.Second
+
 // RetryOptions configuration for retry logic
 type RetryOptions struct {
 	MaxRetries           int
@@ -249,6 +259,36 @@ func canRetryBody(req *http.Request) bool {
 	return req.Body == nil || req.Body == http.NoBody || req.GetBody != nil
 }
 
+// drainAndClose empties resp.Body so its connection can go back to the pool,
+// then closes it. The read is bounded by drainLimit bytes, by drainTimeout,
+// and by ctx, whichever comes first.
+//
+// Draining is only an optimisation, so it must never outrank making progress.
+// Closing the body while the copy is still in flight aborts that read and
+// costs at most one pooled connection; letting the copy run unbounded costs
+// the whole retry.
+func drainAndClose(ctx context.Context, resp *http.Response) {
+	copied := make(chan struct{})
+	go func() {
+		defer close(copied)
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, drainLimit))
+	}()
+
+	timer := time.NewTimer(drainTimeout)
+	defer timer.Stop()
+
+	select {
+	case <-copied:
+	case <-timer.C:
+	case <-ctx.Done():
+	}
+
+	// Safe to call while the copy is still blocked in Read: net/http response
+	// bodies take Close on a separate path from Read, and the close unblocks
+	// the reader so the goroutine above always exits.
+	_ = resp.Body.Close()
+}
+
 // DoRequestWithRetry performs an HTTP request with retry logic.
 //
 // ctx is applied to the request itself, not only to the waits between
@@ -269,12 +309,13 @@ func (c *Client) DoRequestWithRetry(ctx context.Context, req *http.Request, retr
 
 	var lastErr error
 	var lastRetryAfter time.Duration
+	var haveRetryAfter bool
 	maxAttempts := retryOpts.MaxRetries + 1
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
 			delay := jitter(retryOpts.CalculateRetryDelay(attempt - 1))
-			if lastRetryAfter > 0 {
+			if haveRetryAfter {
 				// Honour Retry-After, but never past the configured ceiling.
 				// http.Client.Timeout does not cover this sleep, so an
 				// unbounded value let a server returning "Retry-After: 86400"
@@ -285,6 +326,12 @@ func (c *Client) DoRequestWithRetry(ctx context.Context, req *http.Request, retr
 				// zero ceiling, a configuration the package already supports,
 				// and guarding on "> 0" let every positive Retry-After sail
 				// straight past it.
+				//
+				// The guard is the parser's boolean, not "lastRetryAfter > 0".
+				// "Retry-After: 0" -- and an HTTP-date that has already passed
+				// -- are valid headers meaning "retry now", and testing the
+				// duration threw them away, falling back to a backoff the
+				// server had explicitly waived.
 				delay = min(lastRetryAfter, retryOpts.MaxRetryDelay)
 			}
 
@@ -302,7 +349,7 @@ func (c *Client) DoRequestWithRetry(ctx context.Context, req *http.Request, retr
 				return nil, err
 			}
 
-			lastRetryAfter = 0
+			lastRetryAfter, haveRetryAfter = 0, false
 		}
 
 		resp, err := c.Do(req)
@@ -323,11 +370,10 @@ func (c *Client) DoRequestWithRetry(ctx context.Context, req *http.Request, retr
 		if replayable && retryOpts.IsRetryableError(nil, resp.StatusCode) && attempt < retryOpts.MaxRetries {
 			// Honour an explicit Retry-After over our own backoff.
 			if d, ok := retryAfter(resp); ok {
-				lastRetryAfter = d
+				lastRetryAfter, haveRetryAfter = d, true
 			}
 			// Drain before closing so the connection can be reused.
-			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, drainLimit))
-			_ = resp.Body.Close()
+			drainAndClose(ctx, resp)
 			lastErr = fmt.Errorf("server error: status %d", resp.StatusCode)
 			continue
 		}

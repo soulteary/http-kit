@@ -384,3 +384,84 @@ func TestEmptyMethodIsTreatedAsGET(t *testing.T) {
 		t.Error("POST without an Idempotency-Key was classified idempotent")
 	}
 }
+
+// TestRetryAfterZeroRetriesImmediately is the regression test for guarding the
+// Retry-After override on "lastRetryAfter > 0". "Retry-After: 0" parses to a
+// valid zero duration, but a zero-valued guard read that as "no header" and
+// fell back to the computed backoff -- delaying a retry the server had
+// explicitly waived, by RetryDelay rather than by nothing.
+func TestRetryAfterZeroRetriesImmediately(t *testing.T) {
+	srv := retryAfterServer(t, "0")
+
+	client, _ := NewClient(&Options{BaseURL: srv.URL, Timeout: 10 * time.Second})
+	req, _ := http.NewRequest(http.MethodGet, srv.URL, nil)
+
+	opts := DefaultRetryOptions()
+	opts.MaxRetries = 2
+	opts.RetryDelay = 3 * time.Second
+	opts.MaxRetryDelay = 10 * time.Second
+
+	start := time.Now()
+	resp, err := client.DoRequestWithRetry(context.Background(), req, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("waited %s after \"Retry-After: 0\"; the server asked for an immediate retry", elapsed)
+	}
+}
+
+// TestDrainIsTimeBounded is the regression test for draining a discarded body
+// under a byte ceiling but no time ceiling. A server that answers with a
+// retryable status and then trickles fewer than drainLimit bytes kept the
+// synchronous io.Copy alive forever: a Client with Timeout == 0 sets no read
+// deadline and a background context never cancels the transport, so the body
+// was never closed and the retry never happened.
+func TestDrainIsTimeBounded(t *testing.T) {
+	stall := make(chan struct{})
+	t.Cleanup(func() { close(stall) })
+
+	var attempts int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if atomic.AddInt32(&attempts, 1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("trickle"))
+			w.(http.Flusher).Flush()
+			<-stall // far short of drainLimit, and never another byte
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	// Not srv.Close: it blocks on the handler still parked in <-stall.
+	t.Cleanup(srv.CloseClientConnections)
+
+	// Timeout 0 and a background context below: nothing but drainTimeout
+	// bounds the drain.
+	client, _ := NewClient(&Options{BaseURL: srv.URL})
+	req, _ := http.NewRequest(http.MethodGet, srv.URL, nil)
+
+	type result struct {
+		resp *http.Response
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		resp, err := client.DoRequestWithRetry(context.Background(), req, fastRetryOpts(1))
+		done <- result{resp, err}
+	}()
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("retry failed: %v", got.err)
+		}
+		_ = got.resp.Body.Close()
+		if got.resp.StatusCode != http.StatusOK {
+			t.Errorf("status %d, want 200 from the second attempt", got.resp.StatusCode)
+		}
+	case <-time.After(drainTimeout + 10*time.Second):
+		t.Fatal("draining a stalled body blocked the retry; drainTimeout must bound it")
+	}
+}
