@@ -193,8 +193,11 @@ func jitter(d time.Duration) time.Duration {
 // idempotent; anything else must opt in with the Idempotency-Key header, which
 // is the convention for making a POST safe to replay.
 func isIdempotent(req *http.Request) bool {
+	// An empty Method means GET for a client request (net/http documents
+	// this), so classifying "" as non-idempotent refused to retry a 408, 429
+	// or 5xx on what is in fact a GET.
 	switch req.Method {
-	case http.MethodGet, http.MethodHead, http.MethodPut,
+	case "", http.MethodGet, http.MethodHead, http.MethodPut,
 		http.MethodDelete, http.MethodOptions, http.MethodTrace:
 		return true
 	}
@@ -270,27 +273,35 @@ func (c *Client) DoRequestWithRetry(ctx context.Context, req *http.Request, retr
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
-			if err := rewindBody(req); err != nil {
-				return nil, err
-			}
-
 			delay := jitter(retryOpts.CalculateRetryDelay(attempt - 1))
 			if lastRetryAfter > 0 {
 				// Honour Retry-After, but never past the configured ceiling.
 				// http.Client.Timeout does not cover this sleep, so an
 				// unbounded value let a server returning "Retry-After: 86400"
 				// suspend the call for a day.
-				delay = lastRetryAfter
-				if retryOpts.MaxRetryDelay > 0 && delay > retryOpts.MaxRetryDelay {
-					delay = retryOpts.MaxRetryDelay
-				}
+				//
+				// The cap is applied UNCONDITIONALLY, exactly as
+				// CalculateRetryDelay applies it: a MaxRetryDelay of zero is a
+				// zero ceiling, a configuration the package already supports,
+				// and guarding on "> 0" let every positive Retry-After sail
+				// straight past it.
+				delay = min(lastRetryAfter, retryOpts.MaxRetryDelay)
 			}
 
+			// Wait BEFORE rewinding. rewindBody calls GetBody, which for a
+			// file-backed body opens a new reader; creating it first and then
+			// returning on a cancelled context dropped it unclosed, leaking a
+			// descriptor on every cancelled retry.
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			case <-time.After(delay):
 			}
+
+			if err := rewindBody(req); err != nil {
+				return nil, err
+			}
+
 			lastRetryAfter = 0
 		}
 

@@ -293,3 +293,94 @@ func TestBackoffIsExponential(t *testing.T) {
 		}
 	}
 }
+
+// --- Codex review round 2 (PR #2) ---
+
+// TestRetryAfterRespectsAZeroCeiling is the regression test for the
+// `MaxRetryDelay > 0` guard added in the last round. A zero MaxRetryDelay is a
+// zero ceiling -- a configuration CalculateRetryDelay already honours -- and
+// the guard let every positive Retry-After bypass it, so "Retry-After: 86400"
+// could still suspend a background-context call for a day.
+func TestRetryAfterRespectsAZeroCeiling(t *testing.T) {
+	srv := retryAfterServer(t, "86400")
+
+	client, _ := NewClient(&Options{BaseURL: srv.URL, Timeout: 10 * time.Second})
+	req, _ := http.NewRequest(http.MethodGet, srv.URL, nil)
+
+	opts := fastRetryOpts(2)
+	opts.MaxRetryDelay = 0 // an explicit zero ceiling
+
+	start := time.Now()
+	resp, err := client.DoRequestWithRetry(context.Background(), req, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("waited %s with MaxRetryDelay=0; a zero ceiling must bound Retry-After too", elapsed)
+	}
+}
+
+// TestCancelledRetryDoesNotLeakARewoundBody is the regression test for
+// rewinding before the backoff. rewindBody calls GetBody, which opens a new
+// reader for a file-backed body; creating it and then returning on a cancelled
+// context dropped it unclosed, leaking a descriptor per cancelled retry.
+func TestCancelledRetryDoesNotLeakARewoundBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	var opened, closed int32
+	req, _ := http.NewRequest(http.MethodPut, srv.URL, strings.NewReader("payload"))
+	req.GetBody = func() (io.ReadCloser, error) {
+		atomic.AddInt32(&opened, 1)
+		return &countingBody{Reader: strings.NewReader("payload"), closed: &closed}, nil
+	}
+
+	client, _ := NewClient(&Options{BaseURL: srv.URL, Timeout: 10 * time.Second})
+
+	opts := fastRetryOpts(3)
+	opts.RetryDelay = 200 * time.Millisecond
+	opts.MaxRetryDelay = 200 * time.Millisecond
+
+	// Cancel while the first backoff is in flight.
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	if _, err := client.DoRequestWithRetry(ctx, req, opts); err == nil {
+		t.Fatal("DoRequestWithRetry returned nil error after cancellation")
+	}
+
+	if o, c := atomic.LoadInt32(&opened), atomic.LoadInt32(&closed); o != c {
+		t.Errorf("GetBody opened %d bodies but %d were closed; a cancelled retry leaked one", o, c)
+	}
+}
+
+// countingBody counts Close calls so a leaked body is visible.
+type countingBody struct {
+	*strings.Reader
+	closed *int32
+}
+
+func (b *countingBody) Close() error {
+	atomic.AddInt32(b.closed, 1)
+	return nil
+}
+
+// TestEmptyMethodIsTreatedAsGET: net/http documents an empty Method on a
+// client request as GET, so a 408, 429 or configured 5xx on it must be
+// retried rather than classified non-idempotent.
+func TestEmptyMethodIsTreatedAsGET(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodGet, "http://example.org/", nil)
+	req.Method = ""
+	if !isIdempotent(req) {
+		t.Error("an empty method was classified non-idempotent; net/http sends it as GET")
+	}
+
+	post, _ := http.NewRequest(http.MethodPost, "http://example.org/", nil)
+	if isIdempotent(post) {
+		t.Error("POST without an Idempotency-Key was classified idempotent")
+	}
+}
