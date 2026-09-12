@@ -5,7 +5,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -553,5 +555,174 @@ func TestDrainCloseCannotBlockTheRetry(t *testing.T) {
 		}
 	case <-time.After(drainTimeout + 10*time.Second):
 		t.Fatal("a body whose Close waits for its Read blocked the retry")
+	}
+}
+
+// --- Codex review round 6 (PR #2) ---
+
+// blockingCloseBody reads to EOF at once but blocks in Close, independently of
+// any read. Nothing in http.Response.Body forbids it, and Options.Transport
+// lets a caller supply the RoundTripper that returns one.
+type blockingCloseBody struct {
+	release   chan struct{}
+	closeCall chan struct{} // closed on the first Close
+	once      sync.Once
+}
+
+func (b *blockingCloseBody) Read(p []byte) (int, error) { return 0, io.EOF }
+
+func (b *blockingCloseBody) Close() error {
+	b.once.Do(func() { close(b.closeCall) })
+	<-b.release
+	return nil
+}
+
+// respondingTransport answers the first request with a retryable status and
+// the given body, then succeeds.
+type respondingTransport struct {
+	attempts int32
+	body     io.ReadCloser
+	header   http.Header
+}
+
+func (t *respondingTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	if atomic.AddInt32(&t.attempts, 1) == 1 {
+		header := t.header
+		if header == nil {
+			header = http.Header{}
+		}
+		return &http.Response{
+			StatusCode: http.StatusServiceUnavailable,
+			Header:     header,
+			Body:       t.body,
+			Request:    r,
+		}, nil
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{},
+		Body:       io.NopCloser(strings.NewReader("ok")),
+		Request:    r,
+	}, nil
+}
+
+// TestCompletedDrainCloseCannotBlockTheRetry is the regression test for
+// closing the body inline once the COPY finished.
+//
+// Round 5 moved the timeout and context closes off the calling goroutine, but
+// left the completed-copy branch synchronous on the reasoning that a finished
+// read leaves Close nothing to wait on. That only holds for bodies whose Close
+// blocks BECAUSE of the read. A Close that blocks on its own stalled the retry
+// forever, because by then the timer was no longer participating -- the same
+// unbounded wait the drain bounds exist to prevent, reached one branch over.
+func TestCompletedDrainCloseCannotBlockTheRetry(t *testing.T) {
+	body := &blockingCloseBody{
+		release:   make(chan struct{}),
+		closeCall: make(chan struct{}),
+	}
+	t.Cleanup(func() { close(body.release) })
+
+	tr := &respondingTransport{body: body}
+	client, err := NewClient(&Options{BaseURL: "http://example.org", Transport: tr})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, _ := http.NewRequest(http.MethodGet, "http://example.org/x", nil)
+
+	type result struct {
+		resp *http.Response
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		resp, err := client.DoRequestWithRetry(context.Background(), req, fastRetryOpts(1))
+		done <- result{resp, err}
+	}()
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("retry failed: %v", got.err)
+		}
+		_ = got.resp.Body.Close()
+		if got.resp.StatusCode != http.StatusOK {
+			t.Errorf("status %d, want 200 from the second attempt", got.resp.StatusCode)
+		}
+	case <-time.After(drainTimeout + 10*time.Second):
+		t.Fatal("a body whose Close blocks on its own blocked the retry")
+	}
+
+	// The body must still have been closed, just not on the calling path.
+	select {
+	case <-body.closeCall:
+	case <-time.After(5 * time.Second):
+		t.Error("the body was never closed")
+	}
+}
+
+// TestRetryAfterSecondsSaturate is the regression test for a Retry-After value
+// that overflows time.Duration.
+//
+// Duration counts nanoseconds, so "Retry-After: 9223372037" parses fine and
+// multiplies to a NEGATIVE duration. That negative then won
+// min(lastRetryAfter, MaxRetryDelay) and time.After fired immediately, so a
+// malformed or adversarial upstream stepped straight past the configured
+// ceiling -- the opposite of what bounding Retry-After is for.
+func TestRetryAfterSecondsSaturate(t *testing.T) {
+	const ceiling = 300 * time.Millisecond
+
+	for _, value := range []string{
+		"9223372037",           // one second past what Duration holds
+		"99999999999999999999", // beyond int64 entirely
+	} {
+		t.Run(value, func(t *testing.T) {
+			tr := &respondingTransport{
+				body:   io.NopCloser(strings.NewReader("")),
+				header: http.Header{"Retry-After": []string{value}},
+			}
+			client, err := NewClient(&Options{BaseURL: "http://example.org", Transport: tr})
+			if err != nil {
+				t.Fatal(err)
+			}
+			req, _ := http.NewRequest(http.MethodGet, "http://example.org/x", nil)
+
+			opts := DefaultRetryOptions()
+			opts.MaxRetries = 1
+			opts.RetryDelay = time.Millisecond
+			opts.MaxRetryDelay = ceiling
+
+			start := time.Now()
+			resp, err := client.DoRequestWithRetry(context.Background(), req, opts)
+			elapsed := time.Since(start)
+			if err != nil {
+				t.Fatalf("retry failed: %v", err)
+			}
+			_ = resp.Body.Close()
+
+			if elapsed < ceiling {
+				t.Errorf("retried after %v, want at least the %v ceiling: the overflowed value bypassed it", elapsed, ceiling)
+			}
+			if elapsed > ceiling+10*time.Second {
+				t.Errorf("retried after %v, want it capped at %v", elapsed, ceiling)
+			}
+		})
+	}
+}
+
+// TestRetryAfterAtTheDurationLimit: the largest representable value must not
+// be saturated away, and is still capped by MaxRetryDelay.
+func TestRetryAfterAtTheDurationLimit(t *testing.T) {
+	got, ok := retryAfter(&http.Response{
+		Header: http.Header{"Retry-After": []string{strconv.FormatInt(maxRetryAfterSeconds, 10)}},
+	})
+	if !ok || got <= 0 {
+		t.Fatalf("retryAfter = (%v, %v), want the maximum representable delay", got, ok)
+	}
+
+	over, ok := retryAfter(&http.Response{
+		Header: http.Header{"Retry-After": []string{strconv.FormatInt(maxRetryAfterSeconds+1, 10)}},
+	})
+	if !ok || over != got {
+		t.Errorf("retryAfter(max+1) = (%v, %v), want it saturated to %v", over, ok, got)
 	}
 }

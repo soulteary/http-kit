@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -31,6 +32,10 @@ const drainLimit = 64 << 10
 // context never cancels the transport -- so the retry loop would block forever
 // on a courtesy read.
 const drainTimeout = 2 * time.Second
+
+// maxRetryAfterSeconds is the largest Retry-After value a time.Duration can
+// hold. Duration counts nanoseconds in an int64, so this is roughly 292 years.
+const maxRetryAfterSeconds = int64(math.MaxInt64 / time.Second)
 
 // RetryOptions configuration for retry logic
 type RetryOptions struct {
@@ -220,9 +225,19 @@ func retryAfter(resp *http.Response) (time.Duration, bool) {
 	if v == "" {
 		return 0, false
 	}
-	if secs, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+	if secs, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil || errors.Is(err, strconv.ErrRange) {
 		if secs < 0 {
 			return 0, false
+		}
+		// Saturate BEFORE the multiplication. time.Duration counts
+		// nanoseconds, so anything past ~292 years wraps: "Retry-After:
+		// 9223372037" parses fine and multiplies to a NEGATIVE duration, which
+		// then wins min(..., MaxRetryDelay) and makes time.After fire at once
+		// -- a malformed or adversarial upstream stepping straight past the
+		// configured ceiling. ParseInt's own range error saturates the same
+		// way, so a longer value does not silently revert to backoff.
+		if secs > maxRetryAfterSeconds {
+			return time.Duration(maxRetryAfterSeconds) * time.Second, true
 		}
 		return time.Duration(secs) * time.Second, true
 	}
@@ -268,26 +283,36 @@ func canRetryBody(req *http.Request) bool {
 // the drain costs at most one pooled connection; waiting for it costs the
 // whole retry.
 func drainAndClose(ctx context.Context, resp *http.Response) {
-	copied := make(chan struct{})
+	// Exactly one Close reaches the body, whichever goroutine gets there
+	// first. http.Response.Body is not documented as safe to close twice.
+	var once sync.Once
+	closeBody := func() { once.Do(func() { _ = resp.Body.Close() }) }
+
+	// The copy AND the close run here, under one deadline. Closing on the
+	// caller's side once the copy finished put Close outside the bound: a body
+	// whose Read reaches EOF but whose Close blocks on its own -- nothing in
+	// http.Response.Body forbids that, and Options.Transport lets a caller
+	// supply the RoundTripper that returns one -- stalled the retry forever,
+	// because by then the timer had stopped participating.
+	done := make(chan struct{})
 	go func() {
-		defer close(copied)
+		defer close(done)
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, drainLimit))
+		closeBody()
 	}()
 
 	timer := time.NewTimer(drainTimeout)
 	defer timer.Stop()
 
 	select {
-	case <-copied:
-		// The read is over, so Close cannot be waiting on one. Safe for any
-		// body implementation.
-		_ = resp.Body.Close()
+	case <-done:
+		// Drained and closed within the bound.
 
 	case <-timer.C:
-		closeAsync(resp)
+		closeAsync(closeBody)
 
 	case <-ctx.Done():
-		closeAsync(resp)
+		closeAsync(closeBody)
 	}
 }
 
@@ -303,8 +328,8 @@ func drainAndClose(ctx context.Context, resp *http.Response) {
 //
 // The cost when that happens is one parked goroutine per such response, which
 // is what the alternative already was, minus the stalled request.
-func closeAsync(resp *http.Response) {
-	go func() { _ = resp.Body.Close() }()
+func closeAsync(closeBody func()) {
+	go closeBody()
 }
 
 // DoRequestWithRetry performs an HTTP request with retry logic.
