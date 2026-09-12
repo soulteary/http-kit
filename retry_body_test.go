@@ -465,3 +465,93 @@ func TestDrainIsTimeBounded(t *testing.T) {
 		t.Fatal("draining a stalled body blocked the retry; drainTimeout must bound it")
 	}
 }
+
+// closeWaitsForReadBody is a response body whose Close waits for the active
+// Read to finish -- permitted for http.Response.Body, which carries no
+// concurrent Read/Close requirement, and reachable through Options.Transport.
+type closeWaitsForReadBody struct {
+	readDone chan struct{} // closed when Read returns
+	release  chan struct{} // closed to let Read return
+}
+
+func (b *closeWaitsForReadBody) Read(p []byte) (int, error) {
+	defer close(b.readDone)
+	<-b.release
+	return 0, io.EOF
+}
+
+func (b *closeWaitsForReadBody) Close() error {
+	<-b.readDone // exactly what net/http bodies do NOT do
+	return nil
+}
+
+// stallingTransport answers the first request with a retryable status and a
+// body that stalls, then succeeds.
+type stallingTransport struct {
+	attempts int32
+	body     *closeWaitsForReadBody
+}
+
+func (t *stallingTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	if atomic.AddInt32(&t.attempts, 1) == 1 {
+		return &http.Response{
+			StatusCode: http.StatusServiceUnavailable,
+			Header:     http.Header{},
+			Body:       t.body,
+			Request:    r,
+		}, nil
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{},
+		Body:       io.NopCloser(strings.NewReader("ok")),
+		Request:    r,
+	}, nil
+}
+
+// TestDrainCloseCannotBlockTheRetry is the regression test for closing the
+// body inline once the drain timer has fired.
+//
+// Closing a net/http body mid-read unblocks the reader, but
+// http.Response.Body carries no such requirement, and Options.Transport lets a
+// caller supply a RoundTripper whose Close waits for the active Read. The
+// synchronous Close then blocked behind the very drain the timeout exists to
+// abandon, and the retry still never happened -- the byte and time bounds
+// bought nothing.
+func TestDrainCloseCannotBlockTheRetry(t *testing.T) {
+	body := &closeWaitsForReadBody{
+		readDone: make(chan struct{}),
+		release:  make(chan struct{}),
+	}
+	t.Cleanup(func() { close(body.release) })
+
+	tr := &stallingTransport{body: body}
+	client, err := NewClient(&Options{BaseURL: "http://example.org", Transport: tr})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, _ := http.NewRequest(http.MethodGet, "http://example.org/x", nil)
+
+	type result struct {
+		resp *http.Response
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		resp, err := client.DoRequestWithRetry(context.Background(), req, fastRetryOpts(1))
+		done <- result{resp, err}
+	}()
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("retry failed: %v", got.err)
+		}
+		_ = got.resp.Body.Close()
+		if got.resp.StatusCode != http.StatusOK {
+			t.Errorf("status %d, want 200 from the second attempt", got.resp.StatusCode)
+		}
+	case <-time.After(drainTimeout + 10*time.Second):
+		t.Fatal("a body whose Close waits for its Read blocked the retry")
+	}
+}

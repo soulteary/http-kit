@@ -263,10 +263,10 @@ func canRetryBody(req *http.Request) bool {
 // then closes it. The read is bounded by drainLimit bytes, by drainTimeout,
 // and by ctx, whichever comes first.
 //
-// Draining is only an optimisation, so it must never outrank making progress.
-// Closing the body while the copy is still in flight aborts that read and
-// costs at most one pooled connection; letting the copy run unbounded costs
-// the whole retry.
+// Draining is only an optimisation, so it must never outrank making progress:
+// neither the copy NOR the close is allowed to hold up the retry. Giving up on
+// the drain costs at most one pooled connection; waiting for it costs the
+// whole retry.
 func drainAndClose(ctx context.Context, resp *http.Response) {
 	copied := make(chan struct{})
 	go func() {
@@ -279,14 +279,32 @@ func drainAndClose(ctx context.Context, resp *http.Response) {
 
 	select {
 	case <-copied:
-	case <-timer.C:
-	case <-ctx.Done():
-	}
+		// The read is over, so Close cannot be waiting on one. Safe for any
+		// body implementation.
+		_ = resp.Body.Close()
 
-	// Safe to call while the copy is still blocked in Read: net/http response
-	// bodies take Close on a separate path from Read, and the close unblocks
-	// the reader so the goroutine above always exits.
-	_ = resp.Body.Close()
+	case <-timer.C:
+		closeAsync(resp)
+
+	case <-ctx.Done():
+		closeAsync(resp)
+	}
+}
+
+// closeAsync closes a body this call has stopped waiting for.
+//
+// From a goroutine, because Close is not guaranteed to return either. A
+// net/http body takes Close on a separate path from Read, so closing one
+// mid-read unblocks the reader and both goroutines finish -- but
+// http.Response.Body carries no such requirement in general, and
+// Options.Transport lets a caller supply a RoundTripper whose Close waits for
+// the active Read to end. Calling it inline would then block the retry behind
+// the very drain the timeout exists to abandon.
+//
+// The cost when that happens is one parked goroutine per such response, which
+// is what the alternative already was, minus the stalled request.
+func closeAsync(resp *http.Response) {
+	go func() { _ = resp.Body.Close() }()
 }
 
 // DoRequestWithRetry performs an HTTP request with retry logic.
