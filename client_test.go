@@ -1,7 +1,6 @@
 package httpkit
 
 import (
-	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -14,9 +13,6 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
-
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/propagation"
 )
 
 func TestDefaultOptions(t *testing.T) {
@@ -46,9 +42,11 @@ func TestOptionsValidate(t *testing.T) {
 		wantErr bool
 	}{
 		{
+			// BaseURL is optional: a caller holding absolute URLs of its own
+			// used to have to pass a placeholder to get past this check.
 			name:    "empty base URL",
 			opts:    &Options{},
-			wantErr: true,
+			wantErr: false,
 		},
 		{
 			name: "valid base URL",
@@ -79,13 +77,18 @@ func TestOptionsValidate(t *testing.T) {
 }
 
 func TestNewClient(t *testing.T) {
-	t.Run("nil options uses defaults and fails validation", func(t *testing.T) {
+	t.Run("nil options uses the defaults", func(t *testing.T) {
+		// BaseURL is optional now, so DefaultOptions() is a usable
+		// configuration rather than one that fails validation.
 		client, err := NewClient(nil)
-		if err == nil {
-			t.Error("expected error for nil options with no BaseURL")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
 		}
-		if client != nil {
-			t.Error("expected nil client on error")
+		if client == nil {
+			t.Fatal("expected a client")
+		}
+		if client.GetHTTPClient().Timeout != DefaultOptions().Timeout {
+			t.Errorf("timeout = %v, want the default %v", client.GetHTTPClient().Timeout, DefaultOptions().Timeout)
 		}
 	})
 
@@ -487,56 +490,6 @@ func TestClientDo(t *testing.T) {
 	})
 }
 
-func TestClientInjectTraceContext(t *testing.T) {
-	// Set up a text map propagator
-	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
-		propagation.TraceContext{},
-		propagation.Baggage{},
-	))
-
-	client, err := NewClient(&Options{
-		BaseURL: "http://example.com",
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	t.Run("without active span", func(t *testing.T) {
-		req, _ := http.NewRequest(http.MethodGet, "http://example.com", nil)
-		ctx := context.Background()
-
-		// This should not panic even without active span
-		client.InjectTraceContext(ctx, req)
-
-		// The traceparent header might not be set without an active span,
-		// but the function should complete without error
-	})
-
-	t.Run("with trace context in request", func(t *testing.T) {
-		req, _ := http.NewRequest(http.MethodGet, "http://example.com", nil)
-		ctx := context.Background()
-
-		// Inject trace context
-		client.InjectTraceContext(ctx, req)
-
-		// Verify the function completed without error
-		// Headers may or may not be set depending on tracer state
-	})
-
-	t.Run("preserves existing headers", func(t *testing.T) {
-		req, _ := http.NewRequest(http.MethodGet, "http://example.com", nil)
-		req.Header.Set("X-Custom-Header", "custom-value")
-		ctx := context.Background()
-
-		client.InjectTraceContext(ctx, req)
-
-		// Verify existing headers are preserved
-		if req.Header.Get("X-Custom-Header") != "custom-value" {
-			t.Error("expected existing header to be preserved")
-		}
-	})
-}
-
 func TestClientGetBaseURL(t *testing.T) {
 	client, err := NewClient(&Options{
 		BaseURL: "http://example.com/api",
@@ -809,28 +762,6 @@ func BenchmarkClientDo(b *testing.B) {
 			b.Fatalf("unexpected error: %v", err)
 		}
 		_ = resp.Body.Close()
-	}
-}
-
-func BenchmarkInjectTraceContext(b *testing.B) {
-	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
-		propagation.TraceContext{},
-		propagation.Baggage{},
-	))
-
-	client, err := NewClient(&Options{
-		BaseURL: "http://example.com",
-	})
-	if err != nil {
-		b.Fatalf("unexpected error: %v", err)
-	}
-
-	ctx := context.Background()
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		req, _ := http.NewRequest(http.MethodGet, "http://example.com", nil)
-		client.InjectTraceContext(ctx, req)
 	}
 }
 

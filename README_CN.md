@@ -1,52 +1,92 @@
 # http-kit
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/soulteary/http-kit.svg)](https://pkg.go.dev/github.com/soulteary/http-kit)
+[![Go Reference](https://pkg.go.dev/badge/github.com/soulteary/http-kit/v2.svg)](https://pkg.go.dev/github.com/soulteary/http-kit/v2)
 [![Go Report Card](.github/goreportcard.svg)](.github/goreportcard-report.md)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![codecov](https://codecov.io/gh/soulteary/http-kit/graph/badge.svg)](https://codecov.io/gh/soulteary/http-kit)
 
 [English](README.md)
 
-一个轻量级的 Go HTTP 客户端库，支持 TLS/mTLS、自动重试（指数退避）以及 OpenTelemetry 链路追踪集成。
+一个轻量级的 Go HTTP 客户端库，支持 TLS/mTLS、自动重试（指数退避），以及跨服务传递上下文的 Propagator 钩子。
 
 ## 功能特性
 
 - **TLS/mTLS 支持** - 完整的 TLS 配置，包括 CA 证书、客户端证书用于双向 TLS 认证
-- **自动重试** - 可配置的重试逻辑，支持指数退避处理瞬时故障
-- **OpenTelemetry 集成** - 内置链路追踪上下文传播，支持分布式追踪
+- **自动重试** - 指数退避加抖动，并且只重放确实可以安全重放的请求
+- **上下文传播** - `Propagator` 钩子作用于每一次请求；OpenTelemetry 放在 `otelprop` 子包里
 - **灵活配置** - 灵活的客户端配置，提供合理的默认值
-- **最小依赖** - 仅依赖 OpenTelemetry 用于追踪（可选）
+- **根包只依赖标准库** - 导入 `httpkit` 不会链接任何第三方库
+
+## 包结构
+
+根包不依赖标准库以外的任何东西。凡是需要第三方模块的能力都放进子包，因此导入根包
+不会链接你用不到的库：
+
+| 包 | 会引入 |
+|----|--------|
+| `github.com/soulteary/http-kit/v2` | 无 —— 仅标准库 |
+| `github.com/soulteary/http-kit/v2/otelprop` | `go.opentelemetry.io/otel` |
+
+对一个只导入根包的程序，v1.5.0 与 v2.0.0 的实测对比
+（`CGO_ENABLED=0 go build -trimpath`，go1.27.0 linux/amd64）：
+
+| | v1.5.0 | v2.0.0 |
+|---|---|---|
+| 链接的包数 | 227 | **191** |
+| 参与构建的模块数 | 8 | **1** |
+| 使用方 `go.mod` 里的 `// indirect` 行 | 7 | **0** |
+| 使用方 `go.sum` 里的模块数 | 11 | **1** |
+| 二进制体积 | 9,487,279 B | **7,918,888 B**（−16.5%） |
+
+确实需要链路追踪的程序，开销与以前一样：根包加 `otelprop` 是 228 个包、
+9,494,047 字节，只比 v1.5.0 多一个包和 6,768 字节。
 
 ## 环境要求
 
 - **Go 1.27+**（`go.mod` 声明 `go 1.27.0`）
-- 链路上下文传播依赖 `go.opentelemetry.io/otel`
+- `go.opentelemetry.io/otel`，**仅当**你导入 `otelprop` 时需要
 
 ## 安装
 
 ```bash
-go get github.com/soulteary/http-kit
+go get github.com/soulteary/http-kit/v2
 ```
+
+从 v1 升级？导入路径变了，并且 `Client.InjectTraceContext` 已被移除 ——
+见 [升级说明（v2.0.0）](#升级说明-v200)。
 
 ## 快速开始
 
 ### 基础 HTTP 客户端
 
 ```go
-import "github.com/soulteary/http-kit"
+import httpkit "github.com/soulteary/http-kit/v2"
 
 // 创建简单客户端
 client, err := httpkit.NewClient(&httpkit.Options{
-    BaseURL: "https://api.example.com",
-    Timeout: 10 * time.Second,
+    BaseURL:   "https://api.example.com",
+    Timeout:   10 * time.Second,
+    UserAgent: "myservice/1.0",
 })
 if err != nil {
     log.Fatal(err)
 }
 
-// 发起请求
-req, _ := http.NewRequest("GET", client.GetBaseURL()+"/users", nil)
+// 基于 BaseURL 构造请求并发送
+req, err := client.NewRequest(ctx, http.MethodGet, "v1/users", nil)
+if err != nil {
+    log.Fatal(err)
+}
 resp, err := client.Do(req)
+```
+
+`BaseURL` 是可选的。如果你本来就持有完整 URL，直接传给 `NewRequest`；
+或者干脆不用这个辅助方法，用 `net/http` 自己构造 —— `Do` 和
+`DoRequestWithRetry` 接受任何 `*http.Request`。
+
+```go
+client, _ := httpkit.NewClient(&httpkit.Options{Timeout: 10 * time.Second})
+req, _ := client.NewRequest(ctx, http.MethodGet, "https://other.example.org/raw", nil)
 ```
 
 ### 带 TLS/mTLS 的客户端
@@ -150,16 +190,30 @@ retryable = retryOpts.IsRetryableErrorCtx(ctx, err, resp.StatusCode) // 可区�
 // 尝试的 http.Client.Timeout 与调用方自己的截止时间
 ```
 
-### OpenTelemetry 链路追踪
+### 上下文传播
+
+`Propagator` 会在客户端发出的每一个请求上写入请求头。只需在创建客户端时配置一次，
+调用点上不需要再记着做什么 —— 而这正是旧的 `InjectTraceContext` 要求的，也正是
+漏掉一处调用就会让链路在网络边界上悄无声息地断掉的原因。
+
+```go
+type Propagator interface {
+    Inject(ctx context.Context, h http.Header)
+}
+```
+
+#### OpenTelemetry
 
 ```go
 import (
-    "github.com/soulteary/http-kit"
+    httpkit "github.com/soulteary/http-kit/v2"
+    "github.com/soulteary/http-kit/v2/otelprop"
     "go.opentelemetry.io/otel"
 )
 
 client, _ := httpkit.NewClient(&httpkit.Options{
-    BaseURL: "https://api.example.com",
+    BaseURL:    "https://api.example.com",
+    Propagator: otelprop.Global(), // 使用 otel.GetTextMapPropagator()
 })
 
 // 在应用中创建 span
@@ -167,12 +221,42 @@ tracer := otel.Tracer("my-service")
 ctx, span := tracer.Start(context.Background(), "api-call")
 defer span.End()
 
-// 将追踪上下文注入请求头
-req, _ := http.NewRequest("GET", client.GetBaseURL()+"/data", nil)
-client.InjectTraceContext(ctx, req)
-
+// traceparent 会被自动注入
+req, _ := client.NewRequest(ctx, http.MethodGet, "/data", nil)
 resp, err := client.Do(req)
 ```
+
+`otelprop.Global()` 在**每次注入时**解析全局 propagator，而不是在构造时。这一点很关键：
+`otel.SetTextMapPropagator` 通常在 `main` 里调用，晚于包级构造函数创建的客户端 ——
+提前捕获会把 OpenTelemetry 的 no-op 默认值固化下来，整个进程生命周期内什么都不注入。
+
+如果想给每个客户端单独指定：
+
+```go
+Propagator: otelprop.New(propagation.NewCompositeTextMapPropagator(
+    propagation.TraceContext{}, propagation.Baggage{},
+))
+```
+
+#### 其它传播方式
+
+非 OpenTelemetry 的传播根本不需要子包 —— 它就是一个函数。`MultiPropagator`
+按顺序组合多个。
+
+```go
+Propagator: httpkit.MultiPropagator(
+    otelprop.Global(),
+    httpkit.PropagatorFunc(func(ctx context.Context, h http.Header) {
+        if id, ok := ctx.Value(requestIDKey).(string); ok {
+            h.Set("X-Request-ID", id)
+        }
+    }),
+),
+```
+
+propagator 会在**每一次重试尝试**上运行，因为重试在网络上就是一个新请求。
+对于你用其它方式发送的请求 —— 比如通过 `GetHTTPClient` —— 自行调用
+`client.InjectContext(ctx, req)`；没有配置 propagator 时它是空操作。
 
 ## API 参考
 
@@ -180,10 +264,11 @@ resp, err := client.Do(req)
 
 | 选项 | 类型 | 默认值 | 描述 |
 |------|------|--------|------|
-| `BaseURL` | `string` | 必填 | 所有请求的基础 URL |
+| `BaseURL` | `string` | `""` | `NewRequest` 解析相对路径时的前缀，可选 |
 | `Timeout` | `time.Duration` | `10s` | 请求超时时间 |
 | `UserAgent` | `string` | `""` | User-Agent 请求头值 |
 | `Transport` | `http.RoundTripper` | `nil` | 自定义 HTTP 传输层 |
+| `Propagator` | `Propagator` | `nil` | 向每个请求注入请求头，见[上下文传播](#上下文传播) |
 | `TLSCACertFile` | `string` | `""` | CA 证书文件路径 |
 | `TLSClientCert` | `string` | `""` | 客户端证书文件路径（用于 mTLS） |
 | `TLSClientKey` | `string` | `""` | 客户端私钥文件路径（用于 mTLS） |
@@ -205,11 +290,27 @@ resp, err := client.Do(req)
 | 方法 | 描述 |
 |------|------|
 | `NewClient(opts)` | 使用给定选项创建新的 HTTP 客户端 |
-| `Do(req)` | 执行 HTTP 请求 |
+| `NewRequest(ctx, method, ref, body)` | 基于 `BaseURL` 构造请求，并带上 User-Agent |
+| `ResolveURL(ref)` | `NewRequest` 对 `ref` 会请求的 URL |
+| `Do(req)` | 执行 HTTP 请求，并应用 User-Agent 与 `Propagator` |
 | `DoRequestWithRetry(ctx, req, retryOpts)` | 执行带自动重试的 HTTP 请求 |
-| `InjectTraceContext(ctx, req)` | 将 OpenTelemetry 追踪上下文注入请求头 |
+| `InjectContext(ctx, req)` | 对以其它方式发送的请求应用已配置的 `Propagator` |
 | `GetBaseURL()` | 返回基础 URL |
 | `GetHTTPClient()` | 返回底层的 `*http.Client` |
+
+`ref` 要么是完整 URL（原样使用），要么是与 `BaseURL` 之间只用一个斜杠拼接的路径；
+查询串和 fragment 都会保留。没有 `BaseURL` 时传相对路径会返回错误，而不是发往一个
+不存在的地址。
+
+### 传播
+
+| 符号 | 描述 |
+|------|------|
+| `Propagator` | `Inject(ctx, http.Header)` —— `Do` 在每次尝试时应用的钩子 |
+| `PropagatorFunc` | 把普通函数适配成 `Propagator` |
+| `MultiPropagator(ps...)` | 按顺序应用；跳过 nil 项，全为 nil 时返回 `nil` |
+| `otelprop.Global()` | OpenTelemetry 的全局 propagator，每次注入时解析 |
+| `otelprop.New(p)` | 指定的 `propagation.TextMapPropagator` |
 
 ### 辅助函数
 
@@ -226,12 +327,18 @@ resp, err := client.Do(req)
 
 ```
 http-kit/
-├── client.go       # HTTP 客户端，支持 TLS/mTLS
-├── client_test.go  # 客户端测试
-├── retry.go        # 指数退避重试逻辑
-├── retry_test.go   # 重试测试
-├── go.mod          # 模块定义
-└── LICENSE         # Apache 2.0 许可证
+├── doc.go             # 包文档
+├── client.go          # Client、Options、TLS/mTLS、请求构造
+├── propagator.go      # Propagator 钩子
+├── retry.go           # 重试策略、退避、请求体重放、Retry-After
+├── otelprop/          # OpenTelemetry 传播 —— 唯一链接 otel 的包
+│   └── otelprop.go
+├── example_test.go    # 可运行示例，由 go test 校验
+├── regression_test.go # 守门测试：根包必须保持只依赖标准库
+├── CHANGELOG.md
+├── SECURITY.md
+├── go.mod             # 模块定义
+└── LICENSE            # Apache 2.0 许可证
 ```
 
 ## 安全特性
@@ -245,6 +352,61 @@ http-kit/
 | **不静默降级** | `Transport` 与 TLS 选项同时出现会报错，而不是丢掉 TLS 配置 |
 | **重放安全** | `POST`/`PATCH` 只尝试一次，除非带 `Idempotency-Key` |
 | **退避有界** | `Retry-After` 不会超过 `MaxRetryDelay`，超范围的值会饱和而不是回绕成负值 |
+| **传播是显式的** | 只有配置了 `Propagator` 才会发送这些请求头；把它指向第三方时请先看 [SECURITY.md](SECURITY.md) |
+
+## 升级说明（v2.0.0）
+
+导入路径变了，并且移除了一个方法。其余改动都是增量的。
+
+- **模块路径变为 `github.com/soulteary/http-kit/v2`。** Go 把主版本号编码在导入
+  路径里，所以每个使用者都必须改 —— 包括从来没用过链路追踪的服务。
+
+  ```diff
+  -import "github.com/soulteary/http-kit"
+  +import httpkit "github.com/soulteary/http-kit/v2"
+  ```
+
+  ```bash
+  go get github.com/soulteary/http-kit/v2
+  ```
+
+- **`Client.InjectTraceContext(ctx, req)` 已移除。** 它直接调用
+  `otel.GetTextMapPropagator`，这正是本包的每个使用者都链接了 OpenTelemetry 的原因。
+  改成在客户端上配置 propagator，并删掉每次请求的那行调用：
+
+  ```diff
+   client, _ := httpkit.NewClient(&httpkit.Options{
+       BaseURL: "https://api.example.com",
+  +    Propagator: otelprop.Global(),
+   })
+
+   req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+  -client.InjectTraceContext(ctx, req)
+   resp, err := client.DoRequestWithRetry(ctx, req, retryOpts)
+  ```
+
+  它没有保留成"已废弃"的兼容 shim，原因不只是 shim 必须 import 那个本来要拆掉的依赖。
+  保留这个**名字**会更糟：你的代码照样能编译，却会一声不响地不再传播任何东西，
+  直到你设置了 `Options.Propagator`。编译错误恰恰是我们要的。
+
+  如果你是调用 http-kit 的**库**，建议从你自己的调用方接收一个
+  `httpkit.Propagator` 并透传，而不是自己 import `otelprop` —— 这样由应用来决定，
+  你那些不做链路追踪的用户也就不会链接 OpenTelemetry。
+
+- **`Client.InjectContext(ctx, req)`** 是给"用其它方式发送的请求"准备的直接替代。
+  它应用 `Options.Propagator`，为 nil 时是空操作。
+
+- **`BaseURL` 不再是必填项。** 以前 `NewClient` 会拒绝没有 `BaseURL` 的客户端，
+  尽管除了 `GetBaseURL()` 之外包里没有任何地方读它。如果你之前为了过这道检查传了
+  占位值，现在可以删掉；如果你断言过 `"base URL is required"` 这个错误，该断言现在会失败。
+
+- **`Client.NewRequest(ctx, method, ref, body)`** 取代
+  `http.NewRequest(method, client.GetBaseURL()+"/path", body)`。它只用一个斜杠拼接、
+  保留查询串、带上 User-Agent，并保持 `GetBody` 有值，请求体因此仍可被
+  `DoRequestWithRetry` 重放。
+
+- **`Do` 不会再因为请求的 `Header` 为 nil 而 panic。** 用结构体字面量构造的
+  `*http.Request` 正是这种情况，设置 User-Agent 时会在任何东西发出去之前就 panic。
 
 ## 升级说明（v1.5.0）
 

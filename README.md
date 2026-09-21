@@ -1,52 +1,95 @@
 # http-kit
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/soulteary/http-kit.svg)](https://pkg.go.dev/github.com/soulteary/http-kit)
+[![Go Reference](https://pkg.go.dev/badge/github.com/soulteary/http-kit/v2.svg)](https://pkg.go.dev/github.com/soulteary/http-kit/v2)
 [![Go Report Card](.github/goreportcard.svg)](.github/goreportcard-report.md)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![codecov](https://codecov.io/gh/soulteary/http-kit/graph/badge.svg)](https://codecov.io/gh/soulteary/http-kit)
 
 [中文文档](README_CN.md)
 
-A lightweight Go HTTP client library with TLS/mTLS support, automatic retry with exponential backoff, and OpenTelemetry tracing integration.
+A lightweight Go HTTP client library with TLS/mTLS support, automatic retry
+with exponential backoff, and a hook for propagating context across services.
 
 ## Features
 
 - **TLS/mTLS Support** - Full TLS configuration including CA certificates, client certificates for mutual TLS authentication
-- **Automatic Retry** - Configurable retry logic with exponential backoff for transient failures
-- **OpenTelemetry Integration** - Built-in trace context propagation for distributed tracing
+- **Automatic Retry** - Exponential backoff with jitter, over a policy that knows which requests are safe to replay
+- **Context Propagation** - A `Propagator` hook applied to every request; OpenTelemetry lives in the `otelprop` subpackage
 - **Configurable Options** - Flexible client configuration with sensible defaults
-- **Zero External Dependencies** - Only depends on OpenTelemetry for tracing (optional)
+- **A Standard-Library-Only Root Package** - importing `httpkit` links nothing else
+
+## Layout
+
+The root package depends on nothing outside the standard library. Anything
+needing a third-party module lives in a subpackage, so importing the root
+package never links a library your service does not use:
+
+| Package | Brings in |
+|---------|-----------|
+| `github.com/soulteary/http-kit/v2` | nothing — the standard library only |
+| `github.com/soulteary/http-kit/v2/otelprop` | `go.opentelemetry.io/otel` |
+
+Measured for a program importing only the root package, v1.5.0 against v2.0.0
+(`CGO_ENABLED=0 go build -trimpath`, go1.27.0 linux/amd64):
+
+| | v1.5.0 | v2.0.0 |
+|---|---|---|
+| Linked packages | 227 | **191** |
+| Modules in the build | 8 | **1** |
+| `// indirect` lines in your `go.mod` | 7 | **0** |
+| Modules in your `go.sum` | 11 | **1** |
+| Binary | 9,487,279 B | **7,918,888 B** (−16.5%) |
+
+A program that *does* trace pays what it paid before: root package plus
+`otelprop` is 228 linked packages and a 9,494,047-byte binary — one package
+and 6,768 bytes more than v1.5.0.
 
 ## Requirements
 
 - **Go 1.27+** (`go.mod` declares `go 1.27.0`)
-- `go.opentelemetry.io/otel` for trace-context propagation
+- `go.opentelemetry.io/otel`, **only** if you import `otelprop`
 
 ## Installation
 
 ```bash
-go get github.com/soulteary/http-kit
+go get github.com/soulteary/http-kit/v2
 ```
+
+Upgrading from v1? The import path changed and `Client.InjectTraceContext` is
+gone — see [Upgrade Notes (v2.0.0)](#upgrade-notes-v200).
 
 ## Quick Start
 
 ### Basic HTTP Client
 
 ```go
-import "github.com/soulteary/http-kit"
+import httpkit "github.com/soulteary/http-kit/v2"
 
 // Create a simple client
 client, err := httpkit.NewClient(&httpkit.Options{
-    BaseURL: "https://api.example.com",
-    Timeout: 10 * time.Second,
+    BaseURL:   "https://api.example.com",
+    Timeout:   10 * time.Second,
+    UserAgent: "myservice/1.0",
 })
 if err != nil {
     log.Fatal(err)
 }
 
-// Make a request
-req, _ := http.NewRequest("GET", client.GetBaseURL()+"/users", nil)
+// Build a request against the base URL and send it
+req, err := client.NewRequest(ctx, http.MethodGet, "v1/users", nil)
+if err != nil {
+    log.Fatal(err)
+}
 resp, err := client.Do(req)
+```
+
+`BaseURL` is optional. If you already hold absolute URLs, pass one to
+`NewRequest` — or skip the helper and build requests with `net/http`; `Do` and
+`DoRequestWithRetry` take any `*http.Request`.
+
+```go
+client, _ := httpkit.NewClient(&httpkit.Options{Timeout: 10 * time.Second})
+req, _ := client.NewRequest(ctx, http.MethodGet, "https://other.example.org/raw", nil)
 ```
 
 ### Client with TLS/mTLS
@@ -92,8 +135,8 @@ client, _ := httpkit.NewClient(&httpkit.Options{
 })
 
 // Default retry options: 3 retries, exponential backoff with jitter
-req, _ := http.NewRequest("GET", client.GetBaseURL()+"/data", nil)
-resp, err := client.DoRequestWithRetry(context.Background(), req, nil)
+req, _ := client.NewRequest(ctx, http.MethodGet, "/data", nil)
+resp, err := client.DoRequestWithRetry(ctx, req, nil)
 
 // Or customize
 retryOpts := &httpkit.RetryOptions{
@@ -163,16 +206,31 @@ retryable = retryOpts.IsRetryableErrorCtx(ctx, err, resp.StatusCode) // tells a
 // per-attempt http.Client.Timeout apart from the caller's own deadline
 ```
 
-### OpenTelemetry Tracing
+### Context Propagation
+
+A `Propagator` writes headers on every request the client sends. Configure it
+once, on the client — there is nothing to remember at the call site, which is
+what the old `InjectTraceContext` required and what made a forgotten call a
+trace that silently stopped at the network boundary.
+
+```go
+type Propagator interface {
+    Inject(ctx context.Context, h http.Header)
+}
+```
+
+#### OpenTelemetry
 
 ```go
 import (
-    "github.com/soulteary/http-kit"
+    httpkit "github.com/soulteary/http-kit/v2"
+    "github.com/soulteary/http-kit/v2/otelprop"
     "go.opentelemetry.io/otel"
 )
 
 client, _ := httpkit.NewClient(&httpkit.Options{
-    BaseURL: "https://api.example.com",
+    BaseURL:    "https://api.example.com",
+    Propagator: otelprop.Global(), // uses otel.GetTextMapPropagator()
 })
 
 // Create a span in your application
@@ -180,12 +238,45 @@ tracer := otel.Tracer("my-service")
 ctx, span := tracer.Start(context.Background(), "api-call")
 defer span.End()
 
-// Inject trace context into request headers
-req, _ := http.NewRequest("GET", client.GetBaseURL()+"/data", nil)
-client.InjectTraceContext(ctx, req)
-
+// traceparent is injected automatically
+req, _ := client.NewRequest(ctx, http.MethodGet, "/data", nil)
 resp, err := client.Do(req)
 ```
+
+`otelprop.Global()` resolves the global propagator **at each injection**, not
+at construction time. That matters because `otel.SetTextMapPropagator` is
+normally called from `main`, after any client a package-level constructor
+built — capturing it early would freeze OpenTelemetry's no-op default and
+inject nothing for the life of the process.
+
+To pin one per client instead:
+
+```go
+Propagator: otelprop.New(propagation.NewCompositeTextMapPropagator(
+    propagation.TraceContext{}, propagation.Baggage{},
+))
+```
+
+#### Anything else
+
+Propagation that is not OpenTelemetry needs no subpackage — it is a function.
+`MultiPropagator` composes several, in order.
+
+```go
+Propagator: httpkit.MultiPropagator(
+    otelprop.Global(),
+    httpkit.PropagatorFunc(func(ctx context.Context, h http.Header) {
+        if id, ok := ctx.Value(requestIDKey).(string); ok {
+            h.Set("X-Request-ID", id)
+        }
+    }),
+),
+```
+
+The propagator runs on **every retry attempt**, because a retried request is a
+new request on the wire. For a request you send some other way — through
+`GetHTTPClient`, say — call `client.InjectContext(ctx, req)` yourself; it is a
+no-op when no propagator is configured.
 
 ## API Reference
 
@@ -193,10 +284,11 @@ resp, err := client.Do(req)
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `BaseURL` | `string` | Required | Base URL for all requests |
+| `BaseURL` | `string` | `""` | Prefix `NewRequest` resolves a relative path against. Optional |
 | `Timeout` | `time.Duration` | `10s` | Request timeout |
 | `UserAgent` | `string` | `""` | User-Agent header value |
 | `Transport` | `http.RoundTripper` | `nil` | Custom HTTP transport |
+| `Propagator` | `Propagator` | `nil` | Injects headers into every request. See [Context Propagation](#context-propagation) |
 | `TLSCACertFile` | `string` | `""` | Path to CA certificate file |
 | `TLSClientCert` | `string` | `""` | Path to client certificate file (for mTLS) |
 | `TLSClientKey` | `string` | `""` | Path to client private key file (for mTLS) |
@@ -218,11 +310,28 @@ resp, err := client.Do(req)
 | Method | Description |
 |--------|-------------|
 | `NewClient(opts)` | Creates a new HTTP client with the given options |
-| `Do(req)` | Performs an HTTP request |
+| `NewRequest(ctx, method, ref, body)` | Builds a request against `BaseURL`, with the User-Agent applied |
+| `ResolveURL(ref)` | The URL `NewRequest` would request for `ref` |
+| `Do(req)` | Performs an HTTP request, applying the User-Agent and `Propagator` |
 | `DoRequestWithRetry(ctx, req, retryOpts)` | Performs an HTTP request with automatic retry |
-| `InjectTraceContext(ctx, req)` | Injects OpenTelemetry trace context into request headers |
+| `InjectContext(ctx, req)` | Applies the configured `Propagator` to a request sent some other way |
 | `GetBaseURL()` | Returns the base URL |
 | `GetHTTPClient()` | Returns the underlying `*http.Client` |
+
+`ref` is either an absolute URL, used as it stands, or a path joined to
+`BaseURL` with exactly one slash between the two; its query and fragment
+survive. A relative `ref` with no `BaseURL` is an error rather than a request
+to nowhere.
+
+### Propagation
+
+| Symbol | Description |
+|--------|-------------|
+| `Propagator` | `Inject(ctx, http.Header)` — the hook `Do` applies to every attempt |
+| `PropagatorFunc` | Adapts a plain function to `Propagator` |
+| `MultiPropagator(ps...)` | Applies each in order; nil entries are skipped, and no live entry yields `nil` |
+| `otelprop.Global()` | OpenTelemetry's global propagator, resolved at each injection |
+| `otelprop.New(p)` | A specific `propagation.TextMapPropagator` |
 
 ### Helpers
 
@@ -239,13 +348,18 @@ resp, err := client.Do(req)
 
 ```
 http-kit/
-├── client.go       # HTTP client with TLS/mTLS support
-├── client_test.go  # Client tests
-├── retry.go        # Retry policy, backoff, body replay, Retry-After
-├── retry_test.go   # Retry tests
-├── retry_body_test.go # Body-replay and drain regression tests
-├── go.mod          # Module definition
-└── LICENSE         # Apache 2.0 license
+├── doc.go             # Package documentation
+├── client.go          # Client, Options, TLS/mTLS, request building
+├── propagator.go      # The Propagator hook
+├── retry.go           # Retry policy, backoff, body replay, Retry-After
+├── otelprop/          # OpenTelemetry propagation — the only package that links otel
+│   └── otelprop.go
+├── example_test.go    # Runnable examples, verified by go test
+├── regression_test.go # Gate: the root package must stay standard-library-only
+├── CHANGELOG.md
+├── SECURITY.md
+├── go.mod             # Module definition
+└── LICENSE            # Apache 2.0 license
 ```
 
 ## Security Features
@@ -259,6 +373,71 @@ http-kit/
 | **No Silent Downgrade** | `Transport` together with TLS options is rejected, rather than dropping the TLS config |
 | **Replay Safety** | `POST`/`PATCH` are attempted once unless an `Idempotency-Key` is present |
 | **Bounded Backoff** | A `Retry-After` header cannot exceed `MaxRetryDelay`, and an out-of-range value saturates instead of wrapping negative |
+| **Explicit Propagation** | Headers are sent only when you configure a `Propagator`; see [SECURITY.md](SECURITY.md) on pointing one at a third party |
+
+## Upgrade Notes (v2.0.0)
+
+The import path changed, and one method was removed. Everything else is
+additive.
+
+- **The module path is `github.com/soulteary/http-kit/v2`.** Go encodes the
+  major version in the import path, so every user must update it — including
+  services that never traced anything.
+
+  ```diff
+  -import "github.com/soulteary/http-kit"
+  +import httpkit "github.com/soulteary/http-kit/v2"
+  ```
+
+  ```bash
+  go get github.com/soulteary/http-kit/v2
+  ```
+
+- **`Client.InjectTraceContext(ctx, req)` is gone.** It called
+  `otel.GetTextMapPropagator` directly, which is why every user of this
+  package linked OpenTelemetry. Set a propagator on the client instead, and
+  delete the per-request call:
+
+  ```diff
+   client, _ := httpkit.NewClient(&httpkit.Options{
+       BaseURL: "https://api.example.com",
+  +    Propagator: otelprop.Global(),
+   })
+
+   req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+  -client.InjectTraceContext(ctx, req)
+   resp, err := client.DoRequestWithRetry(ctx, req, retryOpts)
+  ```
+
+  It was not kept as a deprecated shim, and not only because a shim would have
+  to import the dependency it was meant to remove. Keeping the *name* would
+  have been worse: your code would still compile and would silently stop
+  propagating anything until `Options.Propagator` was set. A compiler error is
+  the point.
+
+  If you are a **library** calling http-kit, consider accepting a
+  `httpkit.Propagator` from your own caller and passing it through, rather
+  than importing `otelprop` yourself — then the application decides, and your
+  users who do not trace do not link OpenTelemetry either.
+
+- **`Client.InjectContext(ctx, req)`** is the direct replacement for a request
+  you send some other way. It applies whatever `Options.Propagator` holds, and
+  is a no-op when that is nil.
+
+- **`BaseURL` is no longer required.** `NewClient` used to reject a client
+  without one, even though nothing in the package read it except
+  `GetBaseURL()`. If you passed a placeholder to get past that check, delete
+  it. If you asserted on the `"base URL is required"` error, that assertion
+  now fails.
+
+- **`Client.NewRequest(ctx, method, ref, body)`** replaces
+  `http.NewRequest(method, client.GetBaseURL()+"/path", body)`. It joins with
+  exactly one slash, keeps the query string, applies the User-Agent and leaves
+  `GetBody` populated so the body stays replayable by `DoRequestWithRetry`.
+
+- **`Do` no longer panics on a request with a nil `Header`.** A
+  `*http.Request` built as a struct literal has one, and setting the
+  User-Agent on it panicked before anything was sent.
 
 ## Upgrade Notes (v1.5.0)
 
