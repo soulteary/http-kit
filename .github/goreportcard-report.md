@@ -1,11 +1,11 @@
 # Go Report Card
 
-**Grade: B** (76.5%)
+**Grade: A+** (97.5%)
 
 | Metric | Value |
 | ------ | ----- |
 | Files | 14 |
-| Issues | 0 |
+| Issues | 3 |
 
 ## Checks
 
@@ -13,12 +13,23 @@
 | ----- | ----- |
 | gofmt | 100% |
 | go_vet | 100% |
-| ineffassign | 0% |
-| gocyclo | 0% |
+| gocyclo | 78% |
+| ineffassign | 100% |
 | license | 100% |
-| misspell | 0% |
+| misspell | 100% |
 
-No issues found. Nice work!
+## Issues
+
+### gocyclo
+
+- `retry_test.go`
+  - Line 515: cyclomatic complexity 33 for function TestDoRequestWithRetryEdgeCases
+  - Line 205: cyclomatic complexity 28 for function TestDoRequestWithRetry
+- `client_test.go`
+  - Line 277: cyclomatic complexity 20 for function TestNewClientWithClientCert
+  - Line 79: cyclomatic complexity 16 for function TestNewClient
+- `retry.go`
+  - Line 343: cyclomatic complexity 19 for function (*Client).DoRequestWithRetry
 
 ---
 
