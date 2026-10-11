@@ -1,2 +1,4 @@
 coverage.*
 *.out
+# Raw Go report evidence is uploaded as artifacts, not committed.
+.github/test-results/
