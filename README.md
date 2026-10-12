@@ -43,7 +43,7 @@ and 6,768 bytes more than v1.5.0.
 
 ## Requirements
 
-- **Go 1.27+** (`go.mod` declares `go 1.27.2`)
+- **Go 1.27.2+** (`go.mod` declares `go 1.27.2`)
 - `go.opentelemetry.io/otel`, **only** if you import `otelprop`
 
 ## Installation
