@@ -13,6 +13,7 @@
 - **上下文传播** - `Propagator` 钩子作用于每一次请求；OpenTelemetry 放在 `otelprop` 子包里
 - **灵活配置** - 灵活的客户端配置，提供合理的默认值
 - **根包只依赖标准库** - 导入 `httpkit` 不会链接任何第三方库
+- **不可信目的地址** - 可选的 `outbound` 子包在每次请求和连接时检查 URL、DNS 与地址策略，禁用代理和重定向
 
 ## 包结构
 
@@ -22,6 +23,7 @@
 | 包 | 会引入 |
 |----|--------|
 | `github.com/soulteary/http-kit/v2` | 无 —— 仅标准库 |
+| `github.com/soulteary/http-kit/v2/outbound` | 无 —— 独立的标准库安全策略客户端 |
 | `github.com/soulteary/http-kit/v2/otelprop` | `go.opentelemetry.io/otel` |
 
 对一个只导入根包的程序，v1.5.0 与 v2.0.0 的实测对比
@@ -40,7 +42,7 @@
 
 ## 环境要求
 
-- **Go 1.27.2+**（`go.mod` 声明 `go 1.27.2`）
+- **Go 1.27.3+**（`go.mod` 声明 `go 1.27.3`）
 - `go.opentelemetry.io/otel`，**仅当**你导入 `otelprop` 时需要
 
 ## 安装
@@ -53,6 +55,61 @@ go get github.com/soulteary/http-kit/v2
 见 [升级说明（v2.0.0）](#升级说明-v200)。
 
 ## 快速开始
+
+### 用户提供的 URL 与 Webhook
+
+`outbound` 子包提供面向用户输入 URL 的独立客户端。默认允许公网 HTTPS，
+在发送每次请求前和实际拨号前检查全部 DNS 结果；复用连接时也会重新检查。
+环境变量代理和全部重定向均被禁用，3xx 响应直接交还调用方。
+
+```go
+import (
+    "errors"
+    "net/http"
+
+    "github.com/soulteary/http-kit/v2/outbound"
+)
+
+policy, err := outbound.NewPolicy(outbound.Options{
+    AllowedHosts: []string{"hooks.internal.example"},
+    AllowedCIDRs: []string{"10.20.0.0/16"},
+})
+if err != nil {
+    return err // 配置错误不会回显配置条目。
+}
+client := policy.Client() // 保存并复用这个客户端。
+defer client.CloseIdleConnections()
+
+req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, body)
+if err != nil {
+    return err
+}
+resp, err := client.Do(req)
+if errors.Is(err, outbound.ErrBlocked) {
+    return err // URL 无效或目的地址被策略拒绝，需要调整配置。
+}
+if err != nil {
+    return err
+}
+defer resp.Body.Close()
+// 读取响应正文时另行设置大小上限。
+```
+
+`AllowedHosts` 接受精确域名或不带方括号的 IP 字面量，`AllowedCIDRs` 接受地址前缀。
+它们是默认策略的**例外**，不是只允许名单内目的地址的封闭白名单：其他公网 HTTPS
+仍可访问。例外可以允许内网和明文 HTTP；HTTP 要求每个 DNS 结果在请求时和拨号时
+都明确受信。元数据服务地址、链路本地、多播、未指定地址及指定的地址转换网段，
+即使配置宽泛的例外也不能访问。不接受通配符、域名端口和末尾点。
+`Policy` 零值采用仅允许公网 HTTPS 的默认策略。
+
+`Policy.Validate(ctx, target)` 可用于保存配置时校验，但发送请求仍应使用
+`Policy.Client`，因为 DNS 可能在校验后变化。保留返回客户端的 `Transport` 和
+`CheckRedirect`。它使用十秒超时与标准证书校验，不提供重试或响应正文大小限制。
+DNS 失败返回 `ErrDNSResolution` 或 `ErrNoAddresses`；上下文取消保留对应的 context
+错误。`net/http` 会用带 URL 的 `url.Error` 包装客户端错误，展示或持久化前仍需脱敏。
+
+普通 `httpkit.NewClient` 保持已有代理、重定向和 TLS 行为，导入 `outbound` 不会改变它。
+策略范围见 [SECURITY.md](SECURITY.md)，OwlCron 来源声明见 [NOTICE](NOTICE)。
 
 ### 基础 HTTP 客户端
 

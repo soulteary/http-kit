@@ -21,6 +21,11 @@
 // v2.0.0: 36 fewer linked packages, 7 fewer modules, a 16.5% smaller binary,
 // and an empty indirect requirement block in its own go.mod.
 //
+// For URLs supplied by users, github.com/soulteary/http-kit/v2/outbound provides
+// a separate standard-library-only policy client. It checks every request and
+// connection, permits public HTTPS by default, and disables proxies and redirects.
+// Importing it does not change the general-purpose root client's behavior.
+//
 // # Getting started
 //
 //	client, err := httpkit.NewClient(&httpkit.Options{

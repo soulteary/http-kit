@@ -10,6 +10,22 @@ also changes the module path. The current one is
 
 ## [Unreleased]
 
+### Added
+
+- Standard-library-only `outbound` subpackage, extracted from OwlCron's webhook
+  destination policy. `NewPolicy`, `Policy.Validate` and `Policy.Client` support
+  exact host/CIDR exceptions to a public-HTTPS default. Every request is checked,
+  including reused connections; new connections resolve and validate all answers
+  again before dialing numeric addresses. Plaintext HTTP requires explicit trust
+  at both stages. Proxies and redirects are disabled, and metadata endpoints and
+  selected special/translation ranges remain prohibited despite exceptions.
+- `outbound.ErrBlocked`, `ErrInvalidOptions`, `ErrDNSResolution` and
+  `ErrNoAddresses` for classifying failures without exposing configuration or DNS
+  details. Standard `net/http` client errors still include URLs; callers retain
+  responsibility for error redaction.
+- `NOTICE` and `LICENSE-OWLCRON` preserve the extracted code's MIT attribution and
+  license. The existing generic HTTP client retains its behavior and API.
+
 ## [2.0.0] — 2026-09-21
 
 ### Changed — BREAKING
