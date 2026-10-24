@@ -14,6 +14,7 @@ with exponential backoff, and a hook for propagating context across services.
 - **Context Propagation** - A `Propagator` hook applied to every request; OpenTelemetry lives in the `otelprop` subpackage
 - **Configurable Options** - Flexible client configuration with sensible defaults
 - **A Standard-Library-Only Root Package** - importing `httpkit` links nothing else
+- **Untrusted Destinations** - the optional `outbound` subpackage checks URL and DNS policy on every request and connection; no proxies or redirects
 
 ## Layout
 
@@ -24,6 +25,7 @@ package never links a library your service does not use:
 | Package | Brings in |
 |---------|-----------|
 | `github.com/soulteary/http-kit/v2` | nothing — the standard library only |
+| `github.com/soulteary/http-kit/v2/outbound` | nothing — a separate standard-library-only policy client |
 | `github.com/soulteary/http-kit/v2/otelprop` | `go.opentelemetry.io/otel` |
 
 Measured for a program importing only the root package, v1.5.0 against v2.0.0
@@ -43,7 +45,7 @@ and 6,768 bytes more than v1.5.0.
 
 ## Requirements
 
-- **Go 1.27.2+** (`go.mod` declares `go 1.27.2`)
+- **Go 1.27.3+** (`go.mod` declares `go 1.27.3`)
 - `go.opentelemetry.io/otel`, **only** if you import `otelprop`
 
 ## Installation
@@ -56,6 +58,69 @@ Upgrading from v1? The import path changed and `Client.InjectTraceContext` is
 gone — see [Upgrade Notes (v2.0.0)](#upgrade-notes-v200).
 
 ## Quick Start
+
+### User-supplied URLs and webhooks
+
+The `outbound` subpackage is a separate client for URLs supplied by users. It
+allows public HTTPS destinations by default and checks every DNS answer both
+before a request and immediately before dialing. Request checks also run when
+the connection pool reuses a connection. Environment proxies and all redirects
+are disabled; a 3xx response is returned to the caller.
+
+```go
+import (
+    "errors"
+    "net/http"
+
+    "github.com/soulteary/http-kit/v2/outbound"
+)
+
+policy, err := outbound.NewPolicy(outbound.Options{
+    AllowedHosts: []string{"hooks.internal.example"},
+    AllowedCIDRs: []string{"10.20.0.0/16"},
+})
+if err != nil {
+    return err // Invalid options never repeat the configured entry.
+}
+client := policy.Client() // Keep and reuse this client across requests.
+defer client.CloseIdleConnections()
+
+req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, body)
+if err != nil {
+    return err
+}
+resp, err := client.Do(req)
+if errors.Is(err, outbound.ErrBlocked) {
+    return err // Invalid URL or prohibited destination; changing policy is required.
+}
+if err != nil {
+    return err
+}
+defer resp.Body.Close()
+// Bound the response body when reading it.
+```
+
+`AllowedHosts` contains exact DNS names or bare IP literals; `AllowedCIDRs`
+contains address prefixes. These are **exceptions**, not an exclusive allowlist:
+other public HTTPS destinations remain allowed. They can enable private
+destinations and plaintext HTTP. For HTTP, **all** returned addresses must be
+explicitly trusted at request time and again at connection time. Metadata,
+link-local, multicast, unspecified and selected translation ranges stay blocked
+even with a broad exception. Wildcards, host ports and trailing dots are not
+accepted. The zero-value `Policy` uses the public-HTTPS default.
+
+`Policy.Validate(ctx, target)` is useful when saving configuration, but is not a
+replacement for using `Policy.Client` when sending: DNS can change between
+validation and the request. Keep the returned client's `Transport` and
+`CheckRedirect` intact. It uses a ten-second timeout and standard certificate
+verification; it neither retries nor limits response bodies. DNS failures use
+`ErrDNSResolution` or `ErrNoAddresses`; canceled contexts retain their context
+error. `net/http` wraps client failures in `url.Error`, which includes the URL,
+so callers must redact errors before displaying or persisting them.
+
+The ordinary `httpkit.NewClient` keeps its existing proxy, redirect and TLS
+behavior. Importing `outbound` does not change it. See [SECURITY.md](SECURITY.md)
+for the policy's scope and [NOTICE](NOTICE) for its OwlCron source attribution.
 
 ### Basic HTTP Client
 

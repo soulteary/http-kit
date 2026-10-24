@@ -37,8 +37,46 @@ support branches.
 ## What this library does, and what it does not
 
 http-kit is an outbound HTTP client. It does not serve requests, and it does
-not authenticate anyone. Its security-relevant behaviour is concentrated in
-three places, and all three depend on how *you* configure it.
+not authenticate anyone. The root client and the optional `outbound` policy
+client have different destination guarantees, described below.
+
+### Untrusted URLs use the separate `outbound` client
+
+`outbound.NewPolicy` defaults to public HTTPS destinations. Host and CIDR
+exceptions may permit private addresses or plaintext HTTP; they do not restrict
+other public HTTPS destinations. Treat these exceptions as trusted deployment
+configuration, never as values an untrusted caller may choose.
+
+`Policy.Client` validates the complete URL and every DNS answer on each request,
+including requests over a reused connection. On new connections it resolves and
+checks the answers again, then dials a numeric address without a second resolver
+step. Plaintext HTTP must be explicitly trusted in both checks. The client
+disables environment proxies and all redirects. Userinfo, fragments, zone IDs,
+non-HTTP schemes, noncanonical ports and malformed hosts are rejected.
+
+Exceptions never allow unspecified, multicast or link-local addresses, the
+metadata addresses `100.100.100.200`, `168.63.129.16` and `fd00:ec2::254`, or
+the always-prohibited ranges listed in `outbound/policy.go` (including selected
+IPv4/IPv6 translation and transition ranges). Other special-use ranges are
+blocked unless explicitly trusted. This list is an application policy, not a
+promise to recognize every present or future cloud-specific service address.
+
+`Validate` on its own cannot close a DNS rebinding window: use the returned
+client for the actual request. Replacing its `Transport` or `CheckRedirect`
+can bypass protection. It uses the standard library's certificate validation;
+the root client's TLS options do not configure this separate client. It does
+not authenticate application responses, retry, restrict paths or methods,
+limit response bodies, or isolate networks beyond the listed address policy.
+
+Policy/configuration and DNS sentinel errors do not disclose their input, but
+`http.Client.Do` wraps failures in a `url.Error` containing the requested URL.
+Dial and TLS errors can also include peer details. Redact errors before exposing
+or persisting them, especially when URLs carry query credentials.
+
+The root `httpkit.NewClient` is still a general-purpose client: it does not
+enforce this destination policy and retains its existing proxy and redirect
+behavior. Existing consumers do not acquire SSRF protection merely by updating
+the module.
 
 ### TLS verification is on unless you turn it off
 
