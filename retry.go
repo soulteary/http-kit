@@ -357,38 +357,7 @@ func (c *Client) DoRequestWithRetry(ctx context.Context, req *http.Request, retr
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
-			delay := jitter(retryOpts.CalculateRetryDelay(attempt - 1))
-			if haveRetryAfter {
-				// Honour Retry-After, but never past the configured ceiling.
-				// http.Client.Timeout does not cover this sleep, so an
-				// unbounded value let a server returning "Retry-After: 86400"
-				// suspend the call for a day.
-				//
-				// The cap is applied UNCONDITIONALLY, exactly as
-				// CalculateRetryDelay applies it: a MaxRetryDelay of zero is a
-				// zero ceiling, a configuration the package already supports,
-				// and guarding on "> 0" let every positive Retry-After sail
-				// straight past it.
-				//
-				// The guard is the parser's boolean, not "lastRetryAfter > 0".
-				// "Retry-After: 0" -- and an HTTP-date that has already passed
-				// -- are valid headers meaning "retry now", and testing the
-				// duration threw them away, falling back to a backoff the
-				// server had explicitly waived.
-				delay = min(lastRetryAfter, retryOpts.MaxRetryDelay)
-			}
-
-			// Wait BEFORE rewinding. rewindBody calls GetBody, which for a
-			// file-backed body opens a new reader; creating it first and then
-			// returning on a cancelled context dropped it unclosed, leaking a
-			// descriptor on every cancelled retry.
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(delay):
-			}
-
-			if err := rewindBody(req); err != nil {
+			if err := prepareRetry(ctx, req, retryOpts, attempt-1, lastRetryAfter, haveRetryAfter); err != nil {
 				return nil, err
 			}
 
@@ -398,14 +367,8 @@ func (c *Client) DoRequestWithRetry(ctx context.Context, req *http.Request, retr
 		resp, err := c.Do(req)
 		if err != nil {
 			lastErr = err
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return nil, fmt.Errorf("failed to execute request: %w", err)
-			}
-			if !replayable || !retryOpts.IsRetryableErrorCtx(ctx, err, 0) {
-				return nil, fmt.Errorf("failed to execute request: %w", err)
-			}
-			if attempt >= retryOpts.MaxRetries {
-				return nil, fmt.Errorf("failed to execute request after retries: %w", lastErr)
+			if terminalErr := retryRequestError(ctx, retryOpts, replayable, attempt, err); terminalErr != nil {
+				return nil, terminalErr
 			}
 			continue
 		}
@@ -430,4 +393,54 @@ func (c *Client) DoRequestWithRetry(ctx context.Context, req *http.Request, retr
 		return nil, fmt.Errorf("failed after retries: %w", lastErr)
 	}
 	return nil, fmt.Errorf("no attempts made")
+}
+
+// prepareRetry waits before opening a replacement body. Cancellation during the
+// delay must not create a reader that no attempt will consume or close.
+func prepareRetry(ctx context.Context, req *http.Request, retryOpts *RetryOptions, retryIndex int, lastRetryAfter time.Duration, haveRetryAfter bool) error {
+	delay := jitter(retryOpts.CalculateRetryDelay(retryIndex))
+	if haveRetryAfter {
+		// Honour Retry-After, but never past the configured ceiling.
+		// http.Client.Timeout does not cover this sleep, so an
+		// unbounded value let a server returning "Retry-After: 86400"
+		// suspend the call for a day.
+		//
+		// The cap is applied UNCONDITIONALLY, exactly as
+		// CalculateRetryDelay applies it: a MaxRetryDelay of zero is a
+		// zero ceiling, a configuration the package already supports,
+		// and guarding on "> 0" let every positive Retry-After sail
+		// straight past it.
+		//
+		// The guard is the parser's boolean, not "lastRetryAfter > 0".
+		// "Retry-After: 0" -- and an HTTP-date that has already passed
+		// -- are valid headers meaning "retry now", and testing the
+		// duration threw them away, falling back to a backoff the
+		// server had explicitly waived.
+		delay = min(lastRetryAfter, retryOpts.MaxRetryDelay)
+	}
+
+	// Wait BEFORE rewinding. rewindBody calls GetBody, which for a
+	// file-backed body opens a new reader; creating it first and then
+	// returning on a cancelled context dropped it unclosed, leaking a
+	// descriptor on every cancelled retry.
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(delay):
+	}
+
+	return rewindBody(req)
+}
+
+// retryRequestError preserves transport-error precedence: caller cancellation
+// and unsafe/permanent retries fail immediately, then exhaustion is reported.
+// A nil result means that another attempt is allowed.
+func retryRequestError(ctx context.Context, retryOpts *RetryOptions, replayable bool, attempt int, err error) error {
+	if ctx.Err() != nil || !replayable || !retryOpts.IsRetryableErrorCtx(ctx, err, 0) {
+		return fmt.Errorf("failed to execute request: %w", err)
+	}
+	if attempt >= retryOpts.MaxRetries {
+		return fmt.Errorf("failed to execute request after retries: %w", err)
+	}
+	return nil
 }
