@@ -44,7 +44,7 @@ func TestClientValidatesEveryRequestWithoutPreflight(t *testing.T) {
 			}
 			response, err := client.Do(req)
 			if response != nil {
-				response.Body.Close()
+				_ = response.Body.Close()
 			}
 			if !errors.Is(err, ErrBlocked) {
 				t.Fatalf("Do returned %v, want ErrBlocked", err)
@@ -95,7 +95,7 @@ func TestClientRejectsURLFieldsHiddenByString(t *testing.T) {
 			req := &http.Request{Method: http.MethodPost, URL: test.target, Header: make(http.Header), Body: body}
 			response, err := client.Do(req)
 			if response != nil {
-				response.Body.Close()
+				_ = response.Body.Close()
 			}
 			if !errors.Is(err, ErrBlocked) || dials.Load() != 0 || lookups.Load() != 0 {
 				t.Fatalf("hidden URL field reached transport: err=%v dials=%d lookups=%d", err, dials.Load(), lookups.Load())
@@ -144,7 +144,7 @@ func TestClientExplicitLocalhostAndOriginalRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	data, err := io.ReadAll(response.Body)
-	response.Body.Close()
+	_ = response.Body.Close()
 	if err != nil || string(data) != "delivered" || requests.Load() != 1 {
 		t.Fatalf("response=%q err=%v requests=%d", data, err, requests.Load())
 	}
@@ -157,7 +157,7 @@ func TestClientExplicitLocalhostAndOriginalRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = io.Copy(io.Discard, response.Body)
-	response.Body.Close()
+	_ = response.Body.Close()
 	if err != nil || dials.Load() != 2 || requests.Load() != 2 {
 		t.Fatalf("CloseIdleConnections did not release pooled connection: err=%v dials=%d requests=%d", err, dials.Load(), requests.Load())
 	}
@@ -180,7 +180,7 @@ func TestClientDoesNotFollowRedirect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode != http.StatusFound || response.Header.Get("Location") != destination.URL+"/redirected" {
 		t.Fatalf("redirect response lost: %d %v", response.StatusCode, response.Header)
 	}
@@ -222,7 +222,7 @@ func TestClientIgnoresEnvironmentProxy(t *testing.T) {
 		t.Fatal(err)
 	}
 	data, err := io.ReadAll(response.Body)
-	response.Body.Close()
+	_ = response.Body.Close()
 	if err != nil || string(data) != "origin" || originHits.Load() != 1 || proxyHits.Load() != 0 {
 		t.Fatalf("body=%q err=%v origin=%d proxy=%d", data, err, originHits.Load(), proxyHits.Load())
 	}
@@ -266,7 +266,7 @@ func TestClientRechecksDNSBeforeReusingConnection(t *testing.T) {
 			t.Fatal(err)
 		}
 		_, err = io.Copy(io.Discard, response.Body)
-		response.Body.Close()
+		_ = response.Body.Close()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -278,7 +278,7 @@ func TestClientRechecksDNSBeforeReusingConnection(t *testing.T) {
 	rebound.Store(true)
 	response, err := client.Get(target)
 	if response != nil {
-		response.Body.Close()
+		_ = response.Body.Close()
 	}
 	if !errors.Is(err, ErrBlocked) || lookups.Load() <= before || requests.Load() != 2 || dials.Load() != 1 {
 		t.Fatalf("rebound request err=%v requests=%d dials=%d lookups=%d", err, requests.Load(), dials.Load(), lookups.Load())
@@ -310,7 +310,7 @@ func TestClientRebindingBetweenValidationAndDial(t *testing.T) {
 			defer client.CloseIdleConnections()
 			response, err := client.Get(test.scheme + "://rebind.example/hook")
 			if response != nil {
-				response.Body.Close()
+				_ = response.Body.Close()
 			}
 			if !errors.Is(err, ErrBlocked) || lookups.Load() < 2 || dials.Load() != 0 {
 				t.Fatalf("rebind err=%v lookups=%d dials=%d", err, lookups.Load(), dials.Load())
@@ -360,8 +360,8 @@ func TestPolicyDialTriesOnlyValidatedNumericAddresses(t *testing.T) {
 	}
 	var addresses []string
 	left, right := net.Pipe()
-	defer left.Close()
-	defer right.Close()
+	defer func() { _ = left.Close() }()
+	defer func() { _ = right.Close() }()
 	p.dial = func(_ context.Context, _, address string) (net.Conn, error) {
 		addresses = append(addresses, address)
 		host, _, err := net.SplitHostPort(address)
@@ -410,7 +410,7 @@ func FuzzClientRejectsUserinfoAndFragment(f *testing.F) {
 			req := &http.Request{Method: http.MethodGet, URL: u, Header: make(http.Header)}
 			response, err := client.Do(req)
 			if response != nil {
-				response.Body.Close()
+				_ = response.Body.Close()
 			}
 			if !errors.Is(err, ErrBlocked) {
 				t.Fatalf("request with userinfo or fragment escaped policy: %v", err)

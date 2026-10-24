@@ -26,7 +26,7 @@ func TestZeroPolicyDefaultsAndNilFailsClosed(t *testing.T) {
 	defer client.CloseIdleConnections()
 	response, err := client.Get("https://8.8.8.8/hook")
 	if response != nil {
-		response.Body.Close()
+		_ = response.Body.Close()
 	}
 	if !errors.Is(err, ErrBlocked) {
 		t.Fatalf("nil client policy did not fail closed: %v", err)

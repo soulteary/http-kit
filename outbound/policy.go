@@ -81,7 +81,9 @@ func validDNSHost(host string) bool {
 			return false
 		}
 		for _, ch := range label {
-			if !(ch >= 'a' && ch <= 'z' || ch >= '0' && ch <= '9' || ch == '-') {
+			switch {
+			case ch >= 'a' && ch <= 'z', ch >= '0' && ch <= '9', ch == '-':
+			default:
 				return false
 			}
 		}

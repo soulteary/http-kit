@@ -55,7 +55,7 @@ func TestClientPinsIPWithoutBypassingTLSIdentity(t *testing.T) {
 	defer untrusted.CloseIdleConnections()
 	response, err := untrusted.Get(target)
 	if response != nil {
-		response.Body.Close()
+		_ = response.Body.Close()
 	}
 	var authorityError x509.UnknownAuthorityError
 	if !errors.As(err, &authorityError) || handlerCalls.Load() != 0 {
@@ -74,7 +74,7 @@ func TestClientPinsIPWithoutBypassingTLSIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	body, err := io.ReadAll(response.Body)
-	response.Body.Close()
+	_ = response.Body.Close()
 	if err != nil || string(body) != "verified" {
 		t.Fatalf("TLS response=%q err=%v", body, err)
 	}
@@ -86,7 +86,7 @@ func TestClientPinsIPWithoutBypassingTLSIdentity(t *testing.T) {
 
 	response, err = trusted.Get("https://" + net.JoinHostPort("wrong-certificate.example", port) + requestURI)
 	if response != nil {
-		response.Body.Close()
+		_ = response.Body.Close()
 	}
 	var hostnameError x509.HostnameError
 	if !errors.As(err, &hostnameError) || handlerCalls.Load() != 1 || dials.Load() != 3 {
