@@ -76,109 +76,107 @@ func TestOptionsValidate(t *testing.T) {
 	}
 }
 
-func TestNewClient(t *testing.T) {
-	t.Run("nil options uses the defaults", func(t *testing.T) {
-		// BaseURL is optional now, so DefaultOptions() is a usable
-		// configuration rather than one that fails validation.
-		client, err := NewClient(nil)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if client == nil {
-			t.Fatal("expected a client")
-		}
-		if client.GetHTTPClient().Timeout != DefaultOptions().Timeout {
-			t.Errorf("timeout = %v, want the default %v", client.GetHTTPClient().Timeout, DefaultOptions().Timeout)
-		}
-	})
+func TestNewClientNilOptions(t *testing.T) {
+	// BaseURL is optional now, so DefaultOptions() is a usable
+	// configuration rather than one that fails validation.
+	client, err := NewClient(nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if client == nil {
+		t.Fatal("expected a client")
+	}
+	if client.GetHTTPClient().Timeout != DefaultOptions().Timeout {
+		t.Errorf("timeout = %v, want the default %v", client.GetHTTPClient().Timeout, DefaultOptions().Timeout)
+	}
+}
 
-	t.Run("valid options", func(t *testing.T) {
-		opts := &Options{
-			BaseURL:   "http://example.com",
-			Timeout:   5 * time.Second,
-			UserAgent: "test-agent",
-		}
+func TestNewClientConfiguredOptions(t *testing.T) {
+	opts := &Options{
+		BaseURL:   "http://example.com",
+		Timeout:   5 * time.Second,
+		UserAgent: "test-agent",
+	}
 
-		client, err := NewClient(opts)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
+	client, err := NewClient(opts)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
-		if client.GetBaseURL() != "http://example.com" {
-			t.Errorf("expected baseURL to be http://example.com, got %s", client.GetBaseURL())
-		}
+	if client.GetBaseURL() != "http://example.com" {
+		t.Errorf("expected baseURL to be http://example.com, got %s", client.GetBaseURL())
+	}
 
-		if client.GetHTTPClient().Timeout != 5*time.Second {
-			t.Errorf("expected timeout to be 5s, got %v", client.GetHTTPClient().Timeout)
-		}
-	})
+	if client.GetHTTPClient().Timeout != 5*time.Second {
+		t.Errorf("expected timeout to be 5s, got %v", client.GetHTTPClient().Timeout)
+	}
+}
 
-	t.Run("with custom transport", func(t *testing.T) {
-		customTransport := &http.Transport{
-			MaxIdleConns: 100,
-		}
+func TestNewClientCustomTransport(t *testing.T) {
+	customTransport := &http.Transport{
+		MaxIdleConns: 100,
+	}
 
-		opts := &Options{
-			BaseURL:   "http://example.com",
-			Transport: customTransport,
-		}
+	opts := &Options{
+		BaseURL:   "http://example.com",
+		Transport: customTransport,
+	}
 
-		client, err := NewClient(opts)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
+	client, err := NewClient(opts)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
-		if client.GetHTTPClient().Transport != customTransport {
-			t.Error("expected custom transport to be used")
-		}
-	})
+	if client.GetHTTPClient().Transport != customTransport {
+		t.Error("expected custom transport to be used")
+	}
+}
 
-	t.Run("with InsecureSkipVerify", func(t *testing.T) {
-		opts := &Options{
-			BaseURL:            "https://example.com",
-			InsecureSkipVerify: true,
-		}
+func TestNewClientInsecureSkipVerify(t *testing.T) {
+	opts := &Options{
+		BaseURL:            "https://example.com",
+		InsecureSkipVerify: true,
+	}
 
-		client, err := NewClient(opts)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
+	client, err := NewClient(opts)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
-		transport, ok := client.GetHTTPClient().Transport.(*http.Transport)
-		if !ok {
-			t.Fatal("expected transport to be *http.Transport")
-		}
+	transport, ok := client.GetHTTPClient().Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("expected transport to be *http.Transport")
+	}
 
-		if transport.TLSClientConfig == nil {
-			t.Fatal("expected TLSClientConfig to be set")
-		}
+	if transport.TLSClientConfig == nil {
+		t.Fatal("expected TLSClientConfig to be set")
+	}
 
-		if !transport.TLSClientConfig.InsecureSkipVerify {
-			t.Error("expected InsecureSkipVerify to be true")
-		}
-	})
+	if !transport.TLSClientConfig.InsecureSkipVerify {
+		t.Error("expected InsecureSkipVerify to be true")
+	}
+}
 
-	t.Run("with TLS server name", func(t *testing.T) {
-		opts := &Options{
-			BaseURL:            "https://example.com",
-			InsecureSkipVerify: true,
-			TLSServerName:      "custom.example.com",
-		}
+func TestNewClientTLSServerName(t *testing.T) {
+	opts := &Options{
+		BaseURL:            "https://example.com",
+		InsecureSkipVerify: true,
+		TLSServerName:      "custom.example.com",
+	}
 
-		client, err := NewClient(opts)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
+	client, err := NewClient(opts)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
-		transport, ok := client.GetHTTPClient().Transport.(*http.Transport)
-		if !ok {
-			t.Fatal("expected transport to be *http.Transport")
-		}
+	transport, ok := client.GetHTTPClient().Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("expected transport to be *http.Transport")
+	}
 
-		if transport.TLSClientConfig.ServerName != "custom.example.com" {
-			t.Errorf("expected ServerName to be custom.example.com, got %s", transport.TLSClientConfig.ServerName)
-		}
-	})
+	if transport.TLSClientConfig.ServerName != "custom.example.com" {
+		t.Errorf("expected ServerName to be custom.example.com, got %s", transport.TLSClientConfig.ServerName)
+	}
 }
 
 func TestNewClientWithCACert(t *testing.T) {
@@ -274,13 +272,14 @@ func TestNewClientWithCACert(t *testing.T) {
 	})
 }
 
-func TestNewClientWithClientCert(t *testing.T) {
+func writeTestClientCertificate(t *testing.T) (string, string) {
+	t.Helper()
 	// Create a temporary directory for test certificates
 	tempDir, err := os.MkdirTemp("", "httpkit-test")
 	if err != nil {
 		t.Fatalf("failed to create temp dir: %v", err)
 	}
-	defer func() { _ = os.RemoveAll(tempDir) }()
+	t.Cleanup(func() { _ = os.RemoveAll(tempDir) })
 
 	// Generate a self-signed client certificate
 	clientKey, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -317,105 +316,112 @@ func TestNewClientWithClientCert(t *testing.T) {
 		t.Fatalf("failed to write client key: %v", err)
 	}
 
-	t.Run("valid client certificate", func(t *testing.T) {
-		opts := &Options{
-			BaseURL:       "https://example.com",
-			TLSClientCert: clientCertFile,
-			TLSClientKey:  clientKeyFile,
-		}
+	return clientCertFile, clientKeyFile
+}
 
-		client, err := NewClient(opts)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
+func TestNewClientWithClientCertLoadsCertificate(t *testing.T) {
+	clientCertFile, clientKeyFile := writeTestClientCertificate(t)
+	opts := &Options{
+		BaseURL:       "https://example.com",
+		TLSClientCert: clientCertFile,
+		TLSClientKey:  clientKeyFile,
+	}
 
-		transport, ok := client.GetHTTPClient().Transport.(*http.Transport)
-		if !ok {
-			t.Fatal("expected transport to be *http.Transport")
-		}
+	client, err := NewClient(opts)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
-		if transport.TLSClientConfig == nil {
-			t.Fatal("expected TLSClientConfig to be set")
-		}
+	transport, ok := client.GetHTTPClient().Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("expected transport to be *http.Transport")
+	}
 
-		if len(transport.TLSClientConfig.Certificates) == 0 {
-			t.Error("expected client certificates to be set")
-		}
+	if transport.TLSClientConfig == nil {
+		t.Fatal("expected TLSClientConfig to be set")
+	}
+
+	if len(transport.TLSClientConfig.Certificates) == 0 {
+		t.Error("expected client certificates to be set")
+	}
+}
+
+func TestNewClientWithClientCertRejectsMissingCertificateFile(t *testing.T) {
+	_, clientKeyFile := writeTestClientCertificate(t)
+	opts := &Options{
+		BaseURL:       "https://example.com",
+		TLSClientCert: "/nonexistent/client.crt",
+		TLSClientKey:  clientKeyFile,
+	}
+
+	_, err := NewClient(opts)
+	if err == nil {
+		t.Error("expected error for nonexistent client certificate file")
+	}
+}
+
+// Half-configured mTLS used to build a TLS config with no client
+// certificate in it, so the client silently failed to present one. That is
+// a configuration mistake and is now reported.
+func TestNewClientWithClientCertRejectsMissingKey(t *testing.T) {
+	clientCertFile, _ := writeTestClientCertificate(t)
+	opts := &Options{
+		BaseURL:       "https://example.com",
+		TLSClientCert: clientCertFile,
+		// TLSClientKey is empty
+	}
+
+	if _, err := NewClient(opts); err == nil {
+		t.Error("expected an error when TLSClientCert is set without TLSClientKey")
+	}
+}
+
+// A caller-supplied Transport carries its own TLS configuration, so
+// combining the two silently dropped the TLS options -- including an mTLS
+// client certificate.
+func TestNewClientWithClientCertRejectsCustomTransport(t *testing.T) {
+	clientCertFile, clientKeyFile := writeTestClientCertificate(t)
+	opts := &Options{
+		BaseURL:       "https://example.com",
+		Transport:     http.DefaultTransport,
+		TLSClientCert: clientCertFile,
+		TLSClientKey:  clientKeyFile,
+	}
+
+	if _, err := NewClient(opts); err == nil {
+		t.Error("expected an error when Transport and TLS options are combined")
+	}
+}
+
+// Configuring TLS must not cost proxy support, HTTP/2 or the standard
+// connection-pool limits.
+func TestNewClientWithClientCertPreservesTransportDefaults(t *testing.T) {
+	clientCertFile, clientKeyFile := writeTestClientCertificate(t)
+	client, err := NewClient(&Options{
+		BaseURL:       "https://example.com",
+		TLSClientCert: clientCertFile,
+		TLSClientKey:  clientKeyFile,
 	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
-	t.Run("invalid client certificate file path", func(t *testing.T) {
-		opts := &Options{
-			BaseURL:       "https://example.com",
-			TLSClientCert: "/nonexistent/client.crt",
-			TLSClientKey:  clientKeyFile,
-		}
-
-		_, err := NewClient(opts)
-		if err == nil {
-			t.Error("expected error for nonexistent client certificate file")
-		}
-	})
-
-	// Half-configured mTLS used to build a TLS config with no client
-	// certificate in it, so the client silently failed to present one. That is
-	// a configuration mistake and is now reported.
-	t.Run("missing client key is rejected", func(t *testing.T) {
-		opts := &Options{
-			BaseURL:       "https://example.com",
-			TLSClientCert: clientCertFile,
-			// TLSClientKey is empty
-		}
-
-		if _, err := NewClient(opts); err == nil {
-			t.Error("expected an error when TLSClientCert is set without TLSClientKey")
-		}
-	})
-
-	// A caller-supplied Transport carries its own TLS configuration, so
-	// combining the two silently dropped the TLS options -- including an mTLS
-	// client certificate.
-	t.Run("Transport together with TLS options is rejected", func(t *testing.T) {
-		opts := &Options{
-			BaseURL:       "https://example.com",
-			Transport:     http.DefaultTransport,
-			TLSClientCert: clientCertFile,
-			TLSClientKey:  clientKeyFile,
-		}
-
-		if _, err := NewClient(opts); err == nil {
-			t.Error("expected an error when Transport and TLS options are combined")
-		}
-	})
-
-	// Configuring TLS must not cost proxy support, HTTP/2 or the standard
-	// connection-pool limits.
-	t.Run("TLS transport keeps the standard transport settings", func(t *testing.T) {
-		client, err := NewClient(&Options{
-			BaseURL:       "https://example.com",
-			TLSClientCert: clientCertFile,
-			TLSClientKey:  clientKeyFile,
-		})
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-
-		transport, ok := client.GetHTTPClient().Transport.(*http.Transport)
-		if !ok {
-			t.Fatal("expected transport to be *http.Transport")
-		}
-		if transport.Proxy == nil {
-			t.Error("Proxy is nil: HTTPS_PROXY would be ignored")
-		}
-		if !transport.ForceAttemptHTTP2 {
-			t.Error("ForceAttemptHTTP2 is false: HTTP/2 would not be negotiated")
-		}
-		if transport.MaxIdleConns == 0 {
-			t.Error("MaxIdleConns is 0: the standard pool limits were lost")
-		}
-		if transport.TLSClientConfig == nil || len(transport.TLSClientConfig.Certificates) == 0 {
-			t.Error("the configured client certificate was not applied")
-		}
-	})
+	transport, ok := client.GetHTTPClient().Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("expected transport to be *http.Transport")
+	}
+	if transport.Proxy == nil {
+		t.Error("Proxy is nil: HTTPS_PROXY would be ignored")
+	}
+	if !transport.ForceAttemptHTTP2 {
+		t.Error("ForceAttemptHTTP2 is false: HTTP/2 would not be negotiated")
+	}
+	if transport.MaxIdleConns == 0 {
+		t.Error("MaxIdleConns is 0: the standard pool limits were lost")
+	}
+	if transport.TLSClientConfig == nil || len(transport.TLSClientConfig.Certificates) == 0 {
+		t.Error("the configured client certificate was not applied")
+	}
 }
 
 func TestClientDo(t *testing.T) {

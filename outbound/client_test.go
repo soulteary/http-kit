@@ -107,24 +107,31 @@ func TestClientRejectsURLFieldsHiddenByString(t *testing.T) {
 	}
 }
 
-func TestClientExplicitLocalhostAndOriginalRequest(t *testing.T) {
-	var requests atomic.Int32
+type explicitLocalhostFixture struct {
+	client   *http.Client
+	request  *http.Request
+	requests atomic.Int32
+	dials    atomic.Int32
+}
+
+func newExplicitLocalhostFixture(t *testing.T) *explicitLocalhostFixture {
+	t.Helper()
+	fixture := &explicitLocalhostFixture{}
 	const requestURI = "/hook%2Fsegment?value=1&token=a%2Bb&value=2"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests.Add(1)
+		fixture.requests.Add(1)
 		if r.Header.Get("X-Caller") != "original" || r.RequestURI != requestURI {
 			t.Errorf("request changed at server: %s %v", r.URL, r.Header)
 		}
 		_, _ = io.WriteString(w, "delivered")
 	}))
-	defer server.Close()
+	t.Cleanup(server.Close)
 	p := mustPolicy(t, Options{AllowedHosts: []string{"localhost"}})
 	p.lookup = func(context.Context, string) ([]net.IPAddr, error) {
 		return []net.IPAddr{{IP: net.ParseIP("127.0.0.1")}}, nil
 	}
-	var dials atomic.Int32
 	p.dial = func(ctx context.Context, network, address string) (net.Conn, error) {
-		dials.Add(1)
+		fixture.dials.Add(1)
 		return (&net.Dialer{}).DialContext(ctx, network, address)
 	}
 	_, port, err := net.SplitHostPort(strings.TrimPrefix(server.URL, "http://"))
@@ -136,30 +143,49 @@ func TestClientExplicitLocalhostAndOriginalRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	req.Header.Set("X-Caller", "original")
-	originalURL, originalContext, originalHeader := *req.URL, req.Context(), req.Header.Clone()
-	client := p.Client()
-	defer client.CloseIdleConnections()
-	response, err := client.Do(req)
+	fixture.request = req
+	fixture.client = p.Client()
+	t.Cleanup(fixture.client.CloseIdleConnections)
+	return fixture
+}
+
+func (f *explicitLocalhostFixture) readResponse(t *testing.T) []byte {
+	t.Helper()
+	response, err := f.client.Do(f.request)
 	if err != nil {
 		t.Fatal(err)
 	}
 	data, err := io.ReadAll(response.Body)
 	_ = response.Body.Close()
-	if err != nil || string(data) != "delivered" || requests.Load() != 1 {
-		t.Fatalf("response=%q err=%v requests=%d", data, err, requests.Load())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func TestClientExplicitLocalhostPreservesOriginalRequest(t *testing.T) {
+	fixture := newExplicitLocalhostFixture(t)
+	req := fixture.request
+	originalURL, originalContext, originalHeader := *req.URL, req.Context(), req.Header.Clone()
+	data := fixture.readResponse(t)
+	if string(data) != "delivered" || fixture.requests.Load() != 1 {
+		t.Fatalf("response=%q requests=%d", data, fixture.requests.Load())
 	}
 	if !reflect.DeepEqual(*req.URL, originalURL) || req.Context() != originalContext || !reflect.DeepEqual(req.Header, originalHeader) {
 		t.Fatal("client policy mutated the caller's request")
 	}
-	client.CloseIdleConnections()
-	response, err = client.Do(req)
-	if err != nil {
-		t.Fatal(err)
+}
+
+func TestClientCloseIdleConnectionsReleasesConnection(t *testing.T) {
+	fixture := newExplicitLocalhostFixture(t)
+	data := fixture.readResponse(t)
+	if string(data) != "delivered" || fixture.requests.Load() != 1 {
+		t.Fatalf("response=%q requests=%d", data, fixture.requests.Load())
 	}
-	_, err = io.Copy(io.Discard, response.Body)
-	_ = response.Body.Close()
-	if err != nil || dials.Load() != 2 || requests.Load() != 2 {
-		t.Fatalf("CloseIdleConnections did not release pooled connection: err=%v dials=%d requests=%d", err, dials.Load(), requests.Load())
+	fixture.client.CloseIdleConnections()
+	data = fixture.readResponse(t)
+	if string(data) != "delivered" || fixture.dials.Load() != 2 || fixture.requests.Load() != 2 {
+		t.Fatalf("CloseIdleConnections did not release pooled connection: response=%q dials=%d requests=%d", data, fixture.dials.Load(), fixture.requests.Load())
 	}
 }
 
