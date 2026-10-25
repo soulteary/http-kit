@@ -10,6 +10,8 @@ also changes the module path. The current one is
 
 ## [Unreleased]
 
+## [2.1.0] — 2026-10-25
+
 ### Added
 
 - Standard-library-only `outbound` subpackage, extracted from OwlCron's webhook
@@ -25,6 +27,16 @@ also changes the module path. The current one is
   responsibility for error redaction.
 - `NOTICE` and `LICENSE-OWLCRON` preserve the extracted code's MIT attribution and
   license. The existing generic HTTP client retains its behavior and API.
+
+
+### Changed
+
+- Separate retry preparation and error classification, outbound URL/address
+  checks, and independent test scenarios into focused functions. Public behavior
+  and security policy remain unchanged; all Go Report Card complexity findings
+  are resolved.
+- This release requires Go 1.27.3, as declared by the module. The module path
+  remains `github.com/soulteary/http-kit/v2`.
 
 ## [2.0.0] — 2026-09-21
 
