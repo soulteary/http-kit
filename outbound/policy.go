@@ -92,26 +92,42 @@ func validDNSHost(host string) bool {
 }
 func parseURL(target string) (*url.URL, error) {
 	u, err := url.Parse(target)
-	if err != nil || u.Opaque != "" || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.User != nil || u.Fragment != "" || strings.Contains(target, "#") || strings.ContainsAny(u.Host, "%\\ \t\r\n") {
+	if err != nil {
 		return nil, ErrBlocked
 	}
-	host := strings.ToLower(u.Hostname())
-	if host == "" || strings.HasSuffix(host, ".") {
+	if !validURLShape(u, target) || !validURLHost(u) || !validURLPort(u) {
 		return nil, ErrBlocked
-	}
-	if _, err := netip.ParseAddr(host); err != nil && !validDNSHost(host) {
-		return nil, ErrBlocked
-	}
-	if strings.HasSuffix(u.Host, ":") {
-		return nil, ErrBlocked
-	}
-	if port := u.Port(); port != "" {
-		n, err := strconv.Atoi(port)
-		if err != nil || n < 1 || n > 65535 || strconv.Itoa(n) != port {
-			return nil, ErrBlocked
-		}
 	}
 	return u, nil
+}
+
+func validURLShape(u *url.URL, target string) bool {
+	return u.Opaque == "" && (u.Scheme == "https" || u.Scheme == "http") &&
+		u.Host != "" && u.User == nil && u.Fragment == "" &&
+		!strings.Contains(target, "#") && !strings.ContainsAny(u.Host, "%\\ \t\r\n")
+}
+
+func validURLHost(u *url.URL) bool {
+	host := strings.ToLower(u.Hostname())
+	if host == "" || strings.HasSuffix(host, ".") {
+		return false
+	}
+	if _, err := netip.ParseAddr(host); err == nil {
+		return true
+	}
+	return validDNSHost(host)
+}
+
+func validURLPort(u *url.URL) bool {
+	if strings.HasSuffix(u.Host, ":") {
+		return false
+	}
+	port := u.Port()
+	if port == "" {
+		return true
+	}
+	n, err := strconv.Atoi(port)
+	return err == nil && n >= 1 && n <= 65535 && strconv.Itoa(n) == port
 }
 
 // Special-use ranges are denied by default, including metadata and transition networks.
@@ -137,36 +153,46 @@ var alwaysDeniedNetworks = []netip.Prefix{
 
 func (p *Policy) allowedAddress(host string, addr netip.Addr) (bool, bool) {
 	addr = addr.Unmap()
-	// These destinations remain forbidden even when a broad allowlist is configured.
-	if !addr.IsValid() || addr.IsUnspecified() || addr.IsMulticast() || addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() || (addr == netip.MustParseAddr("100.100.100.200") || addr == netip.MustParseAddr("168.63.129.16") || addr == netip.MustParseAddr("fd00:ec2::254")) {
+	if alwaysDeniedAddress(addr) {
 		return false, false
 	}
-	for _, prefix := range alwaysDeniedNetworks {
-		if prefix.Contains(addr) {
-			return false, false
-		}
-	}
-	if addr.Is6() && netip.MustParsePrefix("::/96").Contains(addr) && !addr.IsLoopback() {
-		return false, false
-	}
-	explicit := p.hosts[host]
-	for _, prefix := range p.networks {
-		if prefix.Contains(addr) {
-			explicit = true
-		}
-	}
-	if explicit {
+	if p.hosts[host] || containsAddress(p.networks, addr) {
 		return true, true
 	}
-	if !addr.IsGlobalUnicast() || (addr.Is6() && !netip.MustParsePrefix("2000::/3").Contains(addr)) {
-		return false, false
+	return defaultAllowedAddress(addr), false
+}
+
+// alwaysDeniedAddress applies before any hostname or CIDR exception.
+func alwaysDeniedAddress(addr netip.Addr) bool {
+	if !addr.IsValid() || addr.IsUnspecified() || addr.IsMulticast() || addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() {
+		return true
 	}
-	for _, prefix := range specialNetworks {
+	if metadataAddress(addr) || containsAddress(alwaysDeniedNetworks, addr) {
+		return true
+	}
+	return addr.Is6() && netip.MustParsePrefix("::/96").Contains(addr) && !addr.IsLoopback()
+}
+
+func metadataAddress(addr netip.Addr) bool {
+	return addr == netip.MustParseAddr("100.100.100.200") ||
+		addr == netip.MustParseAddr("168.63.129.16") ||
+		addr == netip.MustParseAddr("fd00:ec2::254")
+}
+
+func defaultAllowedAddress(addr netip.Addr) bool {
+	if !addr.IsGlobalUnicast() || (addr.Is6() && !netip.MustParsePrefix("2000::/3").Contains(addr)) {
+		return false
+	}
+	return !containsAddress(specialNetworks, addr)
+}
+
+func containsAddress(prefixes []netip.Prefix, addr netip.Addr) bool {
+	for _, prefix := range prefixes {
 		if prefix.Contains(addr) {
-			return false, false
+			return true
 		}
 	}
-	return true, false
+	return false
 }
 func (p *Policy) resolve(ctx context.Context, host string) ([]netip.Addr, bool, error) {
 	if err := ctx.Err(); err != nil {

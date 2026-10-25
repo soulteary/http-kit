@@ -202,269 +202,267 @@ func TestRetryOptionsCalculateRetryDelay(t *testing.T) {
 	}
 }
 
-func TestDoRequestWithRetry(t *testing.T) {
-	t.Run("successful request on first attempt", func(t *testing.T) {
-		var requestCount int32
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			atomic.AddInt32(&requestCount, 1)
-			w.WriteHeader(http.StatusOK)
-		}))
-		defer server.Close()
+func TestDoRequestWithRetryFirstAttemptSucceeds(t *testing.T) {
+	var requestCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requestCount, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
 
-		client, err := NewClient(&Options{BaseURL: server.URL})
-		if err != nil {
-			t.Fatalf("failed to create client: %v", err)
-		}
+	client, err := NewClient(&Options{BaseURL: server.URL})
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
 
-		req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
-		resp, err := client.DoRequestWithRetry(context.Background(), req, nil)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
+	req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
+	resp, err := client.DoRequestWithRetry(context.Background(), req, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
 
-		if resp.StatusCode != http.StatusOK {
-			t.Errorf("expected status 200, got %d", resp.StatusCode)
-		}
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected status 200, got %d", resp.StatusCode)
+	}
 
-		if atomic.LoadInt32(&requestCount) != 1 {
-			t.Errorf("expected 1 request, got %d", requestCount)
-		}
-	})
+	if atomic.LoadInt32(&requestCount) != 1 {
+		t.Errorf("expected 1 request, got %d", requestCount)
+	}
+}
 
-	t.Run("retry on server error then success", func(t *testing.T) {
-		var requestCount int32
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			count := atomic.AddInt32(&requestCount, 1)
-			if count < 3 {
-				w.WriteHeader(http.StatusServiceUnavailable)
-				return
-			}
-			w.WriteHeader(http.StatusOK)
-		}))
-		defer server.Close()
-
-		client, err := NewClient(&Options{BaseURL: server.URL})
-		if err != nil {
-			t.Fatalf("failed to create client: %v", err)
-		}
-
-		req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
-		retryOpts := &RetryOptions{
-			MaxRetries:           3,
-			RetryDelay:           1 * time.Millisecond,
-			MaxRetryDelay:        10 * time.Millisecond,
-			BackoffMultiplier:    1.0,
-			RetryableStatusCodes: []int{http.StatusServiceUnavailable},
-		}
-
-		resp, err := client.DoRequestWithRetry(context.Background(), req, retryOpts)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
-
-		if resp.StatusCode != http.StatusOK {
-			t.Errorf("expected status 200, got %d", resp.StatusCode)
-		}
-
-		if atomic.LoadInt32(&requestCount) != 3 {
-			t.Errorf("expected 3 requests, got %d", requestCount)
-		}
-	})
-
-	t.Run("all retries exhausted with server error", func(t *testing.T) {
-		var requestCount int32
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			atomic.AddInt32(&requestCount, 1)
+func TestDoRequestWithRetryRecoversAfterServerErrors(t *testing.T) {
+	var requestCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := atomic.AddInt32(&requestCount, 1)
+		if count < 3 {
 			w.WriteHeader(http.StatusServiceUnavailable)
-		}))
-		defer server.Close()
-
-		client, err := NewClient(&Options{BaseURL: server.URL})
-		if err != nil {
-			t.Fatalf("failed to create client: %v", err)
+			return
 		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
 
-		req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
-		retryOpts := &RetryOptions{
-			MaxRetries:           2,
-			RetryDelay:           1 * time.Millisecond,
-			MaxRetryDelay:        10 * time.Millisecond,
-			BackoffMultiplier:    1.0,
-			RetryableStatusCodes: []int{http.StatusServiceUnavailable},
-		}
+	client, err := NewClient(&Options{BaseURL: server.URL})
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
 
-		resp, err := client.DoRequestWithRetry(context.Background(), req, retryOpts)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
+	req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
+	retryOpts := &RetryOptions{
+		MaxRetries:           3,
+		RetryDelay:           1 * time.Millisecond,
+		MaxRetryDelay:        10 * time.Millisecond,
+		BackoffMultiplier:    1.0,
+		RetryableStatusCodes: []int{http.StatusServiceUnavailable},
+	}
 
-		// After all retries, return the last response
-		if resp.StatusCode != http.StatusServiceUnavailable {
-			t.Errorf("expected status 503, got %d", resp.StatusCode)
-		}
+	resp, err := client.DoRequestWithRetry(context.Background(), req, retryOpts)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
 
-		// 1 initial + 2 retries = 3 total
-		if atomic.LoadInt32(&requestCount) != 3 {
-			t.Errorf("expected 3 requests, got %d", requestCount)
-		}
-	})
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected status 200, got %d", resp.StatusCode)
+	}
 
-	t.Run("non-retryable status code", func(t *testing.T) {
-		var requestCount int32
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			atomic.AddInt32(&requestCount, 1)
-			w.WriteHeader(http.StatusBadRequest)
-		}))
-		defer server.Close()
+	if atomic.LoadInt32(&requestCount) != 3 {
+		t.Errorf("expected 3 requests, got %d", requestCount)
+	}
+}
 
-		client, err := NewClient(&Options{BaseURL: server.URL})
-		if err != nil {
-			t.Fatalf("failed to create client: %v", err)
-		}
+func TestDoRequestWithRetryExhaustedReturnsLastResponse(t *testing.T) {
+	var requestCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requestCount, 1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
 
-		req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
-		retryOpts := &RetryOptions{
-			MaxRetries:           3,
-			RetryDelay:           1 * time.Millisecond,
-			MaxRetryDelay:        10 * time.Millisecond,
-			BackoffMultiplier:    1.0,
-			RetryableStatusCodes: []int{http.StatusServiceUnavailable},
-		}
+	client, err := NewClient(&Options{BaseURL: server.URL})
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
 
-		resp, err := client.DoRequestWithRetry(context.Background(), req, retryOpts)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
+	req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
+	retryOpts := &RetryOptions{
+		MaxRetries:           2,
+		RetryDelay:           1 * time.Millisecond,
+		MaxRetryDelay:        10 * time.Millisecond,
+		BackoffMultiplier:    1.0,
+		RetryableStatusCodes: []int{http.StatusServiceUnavailable},
+	}
 
-		if resp.StatusCode != http.StatusBadRequest {
-			t.Errorf("expected status 400, got %d", resp.StatusCode)
-		}
+	resp, err := client.DoRequestWithRetry(context.Background(), req, retryOpts)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
 
-		// Should not retry for non-retryable status
-		if atomic.LoadInt32(&requestCount) != 1 {
-			t.Errorf("expected 1 request, got %d", requestCount)
-		}
-	})
+	// After all retries, return the last response
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("expected status 503, got %d", resp.StatusCode)
+	}
 
-	t.Run("context cancelled during retry", func(t *testing.T) {
-		var requestCount int32
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			atomic.AddInt32(&requestCount, 1)
-			w.WriteHeader(http.StatusServiceUnavailable)
-		}))
-		defer server.Close()
+	// 1 initial + 2 retries = 3 total
+	if atomic.LoadInt32(&requestCount) != 3 {
+		t.Errorf("expected 3 requests, got %d", requestCount)
+	}
+}
 
-		client, err := NewClient(&Options{BaseURL: server.URL})
-		if err != nil {
-			t.Fatalf("failed to create client: %v", err)
-		}
+func TestDoRequestWithRetryNonRetryableStatus(t *testing.T) {
+	var requestCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requestCount, 1)
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer server.Close()
 
-		ctx, cancel := context.WithCancel(context.Background())
+	client, err := NewClient(&Options{BaseURL: server.URL})
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
 
-		req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
-		retryOpts := &RetryOptions{
-			MaxRetries:           5,
-			RetryDelay:           100 * time.Millisecond,
-			MaxRetryDelay:        1 * time.Second,
-			BackoffMultiplier:    1.0,
-			RetryableStatusCodes: []int{http.StatusServiceUnavailable},
-		}
+	req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
+	retryOpts := &RetryOptions{
+		MaxRetries:           3,
+		RetryDelay:           1 * time.Millisecond,
+		MaxRetryDelay:        10 * time.Millisecond,
+		BackoffMultiplier:    1.0,
+		RetryableStatusCodes: []int{http.StatusServiceUnavailable},
+	}
 
-		// Cancel context after first request
-		go func() {
-			time.Sleep(50 * time.Millisecond)
-			cancel()
-		}()
+	resp, err := client.DoRequestWithRetry(context.Background(), req, retryOpts)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
 
-		_, err = client.DoRequestWithRetry(ctx, req, retryOpts)
-		if err == nil {
-			t.Error("expected error due to context cancellation")
-		}
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected status 400, got %d", resp.StatusCode)
+	}
 
-		if !errors.Is(err, context.Canceled) {
-			t.Errorf("expected context.Canceled error, got %v", err)
-		}
-	})
+	// Should not retry for non-retryable status
+	if atomic.LoadInt32(&requestCount) != 1 {
+		t.Errorf("expected 1 request, got %d", requestCount)
+	}
+}
 
-	t.Run("nil retry options uses defaults", func(t *testing.T) {
-		var requestCount int32
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			atomic.AddInt32(&requestCount, 1)
-			w.WriteHeader(http.StatusOK)
-		}))
-		defer server.Close()
+func TestDoRequestWithRetryCanceledDuringDelay(t *testing.T) {
+	var requestCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requestCount, 1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
 
-		client, err := NewClient(&Options{BaseURL: server.URL})
-		if err != nil {
-			t.Fatalf("failed to create client: %v", err)
-		}
+	client, err := NewClient(&Options{BaseURL: server.URL})
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
 
-		req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
-		resp, err := client.DoRequestWithRetry(context.Background(), req, nil)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
+	ctx, cancel := context.WithCancel(context.Background())
 
-		if resp.StatusCode != http.StatusOK {
-			t.Errorf("expected status 200, got %d", resp.StatusCode)
-		}
-	})
+	req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
+	retryOpts := &RetryOptions{
+		MaxRetries:           5,
+		RetryDelay:           100 * time.Millisecond,
+		MaxRetryDelay:        1 * time.Second,
+		BackoffMultiplier:    1.0,
+		RetryableStatusCodes: []int{http.StatusServiceUnavailable},
+	}
 
-	t.Run("network error with retries exhausted", func(t *testing.T) {
-		// Use a server that immediately closes
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-		serverURL := server.URL
-		server.Close() // Close immediately to simulate network error
+	// Cancel context after first request
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
 
-		client, err := NewClient(&Options{BaseURL: serverURL})
-		if err != nil {
-			t.Fatalf("failed to create client: %v", err)
-		}
+	_, err = client.DoRequestWithRetry(ctx, req, retryOpts)
+	if err == nil {
+		t.Error("expected error due to context cancellation")
+	}
 
-		req, _ := http.NewRequest(http.MethodGet, serverURL, nil)
-		retryOpts := &RetryOptions{
-			MaxRetries:           2,
-			RetryDelay:           1 * time.Millisecond,
-			MaxRetryDelay:        10 * time.Millisecond,
-			BackoffMultiplier:    1.0,
-			RetryableStatusCodes: []int{http.StatusServiceUnavailable},
-		}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected context.Canceled error, got %v", err)
+	}
+}
 
-		_, err = client.DoRequestWithRetry(context.Background(), req, retryOpts)
-		if err == nil {
-			t.Error("expected error due to network failure")
-		}
-	})
+func TestDoRequestWithRetryDefaultOptions(t *testing.T) {
+	var requestCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requestCount, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
 
-	t.Run("network error not retryable when MaxRetries is 0", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-		serverURL := server.URL
-		server.Close()
+	client, err := NewClient(&Options{BaseURL: server.URL})
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
 
-		client, err := NewClient(&Options{BaseURL: serverURL})
-		if err != nil {
-			t.Fatalf("failed to create client: %v", err)
-		}
+	req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
+	resp, err := client.DoRequestWithRetry(context.Background(), req, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
 
-		req, _ := http.NewRequest(http.MethodGet, serverURL, nil)
-		retryOpts := &RetryOptions{
-			MaxRetries:           0,
-			RetryDelay:           1 * time.Millisecond,
-			MaxRetryDelay:        10 * time.Millisecond,
-			BackoffMultiplier:    1.0,
-			RetryableStatusCodes: []int{http.StatusServiceUnavailable},
-		}
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected status 200, got %d", resp.StatusCode)
+	}
+}
 
-		_, err = client.DoRequestWithRetry(context.Background(), req, retryOpts)
-		if err == nil {
-			t.Error("expected error due to network failure")
-		}
-	})
+func TestDoRequestWithRetryNetworkFailure(t *testing.T) {
+	// Use a server that immediately closes
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	serverURL := server.URL
+	server.Close() // Close immediately to simulate network error
+
+	client, err := NewClient(&Options{BaseURL: serverURL})
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	req, _ := http.NewRequest(http.MethodGet, serverURL, nil)
+	retryOpts := &RetryOptions{
+		MaxRetries:           2,
+		RetryDelay:           1 * time.Millisecond,
+		MaxRetryDelay:        10 * time.Millisecond,
+		BackoffMultiplier:    1.0,
+		RetryableStatusCodes: []int{http.StatusServiceUnavailable},
+	}
+
+	_, err = client.DoRequestWithRetry(context.Background(), req, retryOpts)
+	if err == nil {
+		t.Error("expected error due to network failure")
+	}
+}
+
+func TestDoRequestWithRetryNetworkFailureWithoutRetries(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	serverURL := server.URL
+	server.Close()
+
+	client, err := NewClient(&Options{BaseURL: serverURL})
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	req, _ := http.NewRequest(http.MethodGet, serverURL, nil)
+	retryOpts := &RetryOptions{
+		MaxRetries:           0,
+		RetryDelay:           1 * time.Millisecond,
+		MaxRetryDelay:        10 * time.Millisecond,
+		BackoffMultiplier:    1.0,
+		RetryableStatusCodes: []int{http.StatusServiceUnavailable},
+	}
+
+	_, err = client.DoRequestWithRetry(context.Background(), req, retryOpts)
+	if err == nil {
+		t.Error("expected error due to network failure")
+	}
 }
 
 func TestRetryOptionsCalculateRetryDelayEdgeCases(t *testing.T) {
@@ -512,314 +510,312 @@ func TestRetryOptionsCalculateRetryDelayEdgeCases(t *testing.T) {
 	})
 }
 
-func TestDoRequestWithRetryEdgeCases(t *testing.T) {
-	t.Run("retry with successful response after retryable errors", func(t *testing.T) {
-		var requestCount int32
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			count := atomic.AddInt32(&requestCount, 1)
-			if count == 1 {
-				w.WriteHeader(http.StatusInternalServerError)
-				return
-			}
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte("success"))
-		}))
-		defer server.Close()
-
-		client, err := NewClient(&Options{BaseURL: server.URL})
-		if err != nil {
-			t.Fatalf("failed to create client: %v", err)
+func TestDoRequestWithRetryRecoversAfterInternalServerError(t *testing.T) {
+	var requestCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := atomic.AddInt32(&requestCount, 1)
+		if count == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("success"))
+	}))
+	defer server.Close()
 
-		req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
-		retryOpts := &RetryOptions{
-			MaxRetries:           3,
-			RetryDelay:           1 * time.Millisecond,
-			MaxRetryDelay:        10 * time.Millisecond,
-			BackoffMultiplier:    1.0,
-			RetryableStatusCodes: []int{http.StatusInternalServerError},
-		}
+	client, err := NewClient(&Options{BaseURL: server.URL})
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
 
-		resp, err := client.DoRequestWithRetry(context.Background(), req, retryOpts)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
+	req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
+	retryOpts := &RetryOptions{
+		MaxRetries:           3,
+		RetryDelay:           1 * time.Millisecond,
+		MaxRetryDelay:        10 * time.Millisecond,
+		BackoffMultiplier:    1.0,
+		RetryableStatusCodes: []int{http.StatusInternalServerError},
+	}
 
-		if resp.StatusCode != http.StatusOK {
-			t.Errorf("expected status 200, got %d", resp.StatusCode)
-		}
+	resp, err := client.DoRequestWithRetry(context.Background(), req, retryOpts)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
 
-		if atomic.LoadInt32(&requestCount) != 2 {
-			t.Errorf("expected 2 requests, got %d", requestCount)
-		}
-	})
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected status 200, got %d", resp.StatusCode)
+	}
 
-	t.Run("last retry returns response", func(t *testing.T) {
-		var requestCount int32
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			count := atomic.AddInt32(&requestCount, 1)
-			if count <= 2 {
-				w.WriteHeader(http.StatusServiceUnavailable)
-				return
-			}
-			// On last attempt (3rd), return success
-			w.WriteHeader(http.StatusOK)
-		}))
-		defer server.Close()
+	if atomic.LoadInt32(&requestCount) != 2 {
+		t.Errorf("expected 2 requests, got %d", requestCount)
+	}
+}
 
-		client, err := NewClient(&Options{BaseURL: server.URL})
-		if err != nil {
-			t.Fatalf("failed to create client: %v", err)
-		}
-
-		req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
-		retryOpts := &RetryOptions{
-			MaxRetries:           2, // 1 initial + 2 retries = 3 total
-			RetryDelay:           1 * time.Millisecond,
-			MaxRetryDelay:        10 * time.Millisecond,
-			BackoffMultiplier:    1.0,
-			RetryableStatusCodes: []int{http.StatusServiceUnavailable},
-		}
-
-		resp, err := client.DoRequestWithRetry(context.Background(), req, retryOpts)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
-
-		if resp.StatusCode != http.StatusOK {
-			t.Errorf("expected status 200, got %d", resp.StatusCode)
-		}
-	})
-
-	t.Run("retryable error on last attempt returns error", func(t *testing.T) {
-		var requestCount int32
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			atomic.AddInt32(&requestCount, 1)
-			// Always return retryable error
-			w.WriteHeader(http.StatusBadGateway)
-		}))
-		defer server.Close()
-
-		client, err := NewClient(&Options{BaseURL: server.URL})
-		if err != nil {
-			t.Fatalf("failed to create client: %v", err)
-		}
-
-		req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
-		retryOpts := &RetryOptions{
-			MaxRetries:           1, // 1 initial + 1 retry = 2 total
-			RetryDelay:           1 * time.Millisecond,
-			MaxRetryDelay:        10 * time.Millisecond,
-			BackoffMultiplier:    1.0,
-			RetryableStatusCodes: []int{http.StatusBadGateway},
-		}
-
-		resp, err := client.DoRequestWithRetry(context.Background(), req, retryOpts)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
-
-		// On last attempt, returns the response even if retryable
-		if resp.StatusCode != http.StatusBadGateway {
-			t.Errorf("expected status 502, got %d", resp.StatusCode)
-		}
-
-		if atomic.LoadInt32(&requestCount) != 2 {
-			t.Errorf("expected 2 requests, got %d", requestCount)
-		}
-	})
-
-	t.Run("zero max retries executes once", func(t *testing.T) {
-		var requestCount int32
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			atomic.AddInt32(&requestCount, 1)
-			w.WriteHeader(http.StatusOK)
-		}))
-		defer server.Close()
-
-		client, err := NewClient(&Options{BaseURL: server.URL})
-		if err != nil {
-			t.Fatalf("failed to create client: %v", err)
-		}
-
-		req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
-		retryOpts := &RetryOptions{
-			MaxRetries:           0,
-			RetryDelay:           1 * time.Millisecond,
-			MaxRetryDelay:        10 * time.Millisecond,
-			BackoffMultiplier:    1.0,
-			RetryableStatusCodes: []int{http.StatusServiceUnavailable},
-		}
-
-		resp, err := client.DoRequestWithRetry(context.Background(), req, retryOpts)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
-
-		if resp.StatusCode != http.StatusOK {
-			t.Errorf("expected status 200, got %d", resp.StatusCode)
-		}
-
-		if atomic.LoadInt32(&requestCount) != 1 {
-			t.Errorf("expected 1 request, got %d", requestCount)
-		}
-	})
-
-	t.Run("server error on zero max retries returns response", func(t *testing.T) {
-		var requestCount int32
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			atomic.AddInt32(&requestCount, 1)
+func TestDoRequestWithRetryLastAttemptSucceeds(t *testing.T) {
+	var requestCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := atomic.AddInt32(&requestCount, 1)
+		if count <= 2 {
 			w.WriteHeader(http.StatusServiceUnavailable)
-		}))
-		defer server.Close()
-
-		client, err := NewClient(&Options{BaseURL: server.URL})
-		if err != nil {
-			t.Fatalf("failed to create client: %v", err)
+			return
 		}
+		// On last attempt (3rd), return success
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
 
-		req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
-		retryOpts := &RetryOptions{
-			MaxRetries:           0,
-			RetryDelay:           1 * time.Millisecond,
-			MaxRetryDelay:        10 * time.Millisecond,
-			BackoffMultiplier:    1.0,
-			RetryableStatusCodes: []int{http.StatusServiceUnavailable},
-		}
+	client, err := NewClient(&Options{BaseURL: server.URL})
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
 
-		resp, err := client.DoRequestWithRetry(context.Background(), req, retryOpts)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
+	req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
+	retryOpts := &RetryOptions{
+		MaxRetries:           2, // 1 initial + 2 retries = 3 total
+		RetryDelay:           1 * time.Millisecond,
+		MaxRetryDelay:        10 * time.Millisecond,
+		BackoffMultiplier:    1.0,
+		RetryableStatusCodes: []int{http.StatusServiceUnavailable},
+	}
 
-		// With 0 retries, returns response immediately
-		if resp.StatusCode != http.StatusServiceUnavailable {
-			t.Errorf("expected status 503, got %d", resp.StatusCode)
-		}
+	resp, err := client.DoRequestWithRetry(context.Background(), req, retryOpts)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
 
-		if atomic.LoadInt32(&requestCount) != 1 {
-			t.Errorf("expected 1 request, got %d", requestCount)
-		}
-	})
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected status 200, got %d", resp.StatusCode)
+	}
+}
 
-	t.Run("negative max retries makes no attempts", func(t *testing.T) {
-		var requestCount int32
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			atomic.AddInt32(&requestCount, 1)
+func TestDoRequestWithRetryFinalRetryableResponse(t *testing.T) {
+	var requestCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requestCount, 1)
+		// Always return retryable error
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer server.Close()
+
+	client, err := NewClient(&Options{BaseURL: server.URL})
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
+	retryOpts := &RetryOptions{
+		MaxRetries:           1, // 1 initial + 1 retry = 2 total
+		RetryDelay:           1 * time.Millisecond,
+		MaxRetryDelay:        10 * time.Millisecond,
+		BackoffMultiplier:    1.0,
+		RetryableStatusCodes: []int{http.StatusBadGateway},
+	}
+
+	resp, err := client.DoRequestWithRetry(context.Background(), req, retryOpts)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	// On last attempt, returns the response even if retryable
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Errorf("expected status 502, got %d", resp.StatusCode)
+	}
+
+	if atomic.LoadInt32(&requestCount) != 2 {
+		t.Errorf("expected 2 requests, got %d", requestCount)
+	}
+}
+
+func TestDoRequestWithRetryZeroRetriesSucceedsOnce(t *testing.T) {
+	var requestCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requestCount, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client, err := NewClient(&Options{BaseURL: server.URL})
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
+	retryOpts := &RetryOptions{
+		MaxRetries:           0,
+		RetryDelay:           1 * time.Millisecond,
+		MaxRetryDelay:        10 * time.Millisecond,
+		BackoffMultiplier:    1.0,
+		RetryableStatusCodes: []int{http.StatusServiceUnavailable},
+	}
+
+	resp, err := client.DoRequestWithRetry(context.Background(), req, retryOpts)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected status 200, got %d", resp.StatusCode)
+	}
+
+	if atomic.LoadInt32(&requestCount) != 1 {
+		t.Errorf("expected 1 request, got %d", requestCount)
+	}
+}
+
+func TestDoRequestWithRetryZeroRetriesReturnsServerError(t *testing.T) {
+	var requestCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requestCount, 1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	client, err := NewClient(&Options{BaseURL: server.URL})
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
+	retryOpts := &RetryOptions{
+		MaxRetries:           0,
+		RetryDelay:           1 * time.Millisecond,
+		MaxRetryDelay:        10 * time.Millisecond,
+		BackoffMultiplier:    1.0,
+		RetryableStatusCodes: []int{http.StatusServiceUnavailable},
+	}
+
+	resp, err := client.DoRequestWithRetry(context.Background(), req, retryOpts)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	// With 0 retries, returns response immediately
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("expected status 503, got %d", resp.StatusCode)
+	}
+
+	if atomic.LoadInt32(&requestCount) != 1 {
+		t.Errorf("expected 1 request, got %d", requestCount)
+	}
+}
+
+func TestDoRequestWithRetryNegativeRetriesSkipsRequests(t *testing.T) {
+	var requestCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requestCount, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client, err := NewClient(&Options{BaseURL: server.URL})
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
+	retryOpts := &RetryOptions{
+		MaxRetries:           -1, // maxAttempts = 0
+		RetryDelay:           1 * time.Millisecond,
+		MaxRetryDelay:        10 * time.Millisecond,
+		BackoffMultiplier:    1.0,
+		RetryableStatusCodes: []int{http.StatusServiceUnavailable},
+	}
+
+	_, err = client.DoRequestWithRetry(context.Background(), req, retryOpts)
+	if err == nil {
+		t.Error("expected error when no attempts are made")
+	}
+
+	if atomic.LoadInt32(&requestCount) != 0 {
+		t.Errorf("expected 0 requests, got %d", requestCount)
+	}
+}
+
+func TestDoRequestWithRetryDeadlineDuringDelay(t *testing.T) {
+	var requestCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requestCount, 1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	client, err := NewClient(&Options{BaseURL: server.URL})
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
+	retryOpts := &RetryOptions{
+		MaxRetries:           5,
+		RetryDelay:           200 * time.Millisecond, // Longer than context timeout
+		MaxRetryDelay:        1 * time.Second,
+		BackoffMultiplier:    1.0,
+		RetryableStatusCodes: []int{http.StatusServiceUnavailable},
+	}
+
+	_, err = client.DoRequestWithRetry(ctx, req, retryOpts)
+	if err == nil {
+		t.Error("expected error due to context deadline")
+	}
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("expected context.DeadlineExceeded error, got %v", err)
+	}
+}
+
+func TestDoRequestWithRetryMultipleRetryableStatuses(t *testing.T) {
+	var requestCount int32
+	statusCodes := []int{
+		http.StatusServiceUnavailable,
+		http.StatusBadGateway,
+		http.StatusOK,
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := int(atomic.AddInt32(&requestCount, 1))
+		if count <= len(statusCodes) {
+			w.WriteHeader(statusCodes[count-1])
+		} else {
 			w.WriteHeader(http.StatusOK)
-		}))
-		defer server.Close()
-
-		client, err := NewClient(&Options{BaseURL: server.URL})
-		if err != nil {
-			t.Fatalf("failed to create client: %v", err)
 		}
+	}))
+	defer server.Close()
 
-		req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
-		retryOpts := &RetryOptions{
-			MaxRetries:           -1, // maxAttempts = 0
-			RetryDelay:           1 * time.Millisecond,
-			MaxRetryDelay:        10 * time.Millisecond,
-			BackoffMultiplier:    1.0,
-			RetryableStatusCodes: []int{http.StatusServiceUnavailable},
-		}
+	client, err := NewClient(&Options{BaseURL: server.URL})
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
 
-		_, err = client.DoRequestWithRetry(context.Background(), req, retryOpts)
-		if err == nil {
-			t.Error("expected error when no attempts are made")
-		}
+	req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
+	retryOpts := &RetryOptions{
+		MaxRetries:           5,
+		RetryDelay:           1 * time.Millisecond,
+		MaxRetryDelay:        10 * time.Millisecond,
+		BackoffMultiplier:    1.0,
+		RetryableStatusCodes: []int{http.StatusServiceUnavailable, http.StatusBadGateway},
+	}
 
-		if atomic.LoadInt32(&requestCount) != 0 {
-			t.Errorf("expected 0 requests, got %d", requestCount)
-		}
-	})
+	resp, err := client.DoRequestWithRetry(context.Background(), req, retryOpts)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
 
-	t.Run("context deadline exceeded during delay", func(t *testing.T) {
-		var requestCount int32
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			atomic.AddInt32(&requestCount, 1)
-			w.WriteHeader(http.StatusServiceUnavailable)
-		}))
-		defer server.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected status 200, got %d", resp.StatusCode)
+	}
 
-		client, err := NewClient(&Options{BaseURL: server.URL})
-		if err != nil {
-			t.Fatalf("failed to create client: %v", err)
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-		defer cancel()
-
-		req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
-		retryOpts := &RetryOptions{
-			MaxRetries:           5,
-			RetryDelay:           200 * time.Millisecond, // Longer than context timeout
-			MaxRetryDelay:        1 * time.Second,
-			BackoffMultiplier:    1.0,
-			RetryableStatusCodes: []int{http.StatusServiceUnavailable},
-		}
-
-		_, err = client.DoRequestWithRetry(ctx, req, retryOpts)
-		if err == nil {
-			t.Error("expected error due to context deadline")
-		}
-
-		if !errors.Is(err, context.DeadlineExceeded) {
-			t.Errorf("expected context.DeadlineExceeded error, got %v", err)
-		}
-	})
-
-	t.Run("multiple retryable status codes", func(t *testing.T) {
-		var requestCount int32
-		statusCodes := []int{
-			http.StatusServiceUnavailable,
-			http.StatusBadGateway,
-			http.StatusOK,
-		}
-
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			count := int(atomic.AddInt32(&requestCount, 1))
-			if count <= len(statusCodes) {
-				w.WriteHeader(statusCodes[count-1])
-			} else {
-				w.WriteHeader(http.StatusOK)
-			}
-		}))
-		defer server.Close()
-
-		client, err := NewClient(&Options{BaseURL: server.URL})
-		if err != nil {
-			t.Fatalf("failed to create client: %v", err)
-		}
-
-		req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
-		retryOpts := &RetryOptions{
-			MaxRetries:           5,
-			RetryDelay:           1 * time.Millisecond,
-			MaxRetryDelay:        10 * time.Millisecond,
-			BackoffMultiplier:    1.0,
-			RetryableStatusCodes: []int{http.StatusServiceUnavailable, http.StatusBadGateway},
-		}
-
-		resp, err := client.DoRequestWithRetry(context.Background(), req, retryOpts)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
-
-		if resp.StatusCode != http.StatusOK {
-			t.Errorf("expected status 200, got %d", resp.StatusCode)
-		}
-
-		if atomic.LoadInt32(&requestCount) != 3 {
-			t.Errorf("expected 3 requests, got %d", requestCount)
-		}
-	})
+	if atomic.LoadInt32(&requestCount) != 3 {
+		t.Errorf("expected 3 requests, got %d", requestCount)
+	}
 }
 
 // Benchmarks
