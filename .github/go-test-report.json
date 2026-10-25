@@ -1,24 +1,24 @@
 {
   "schema_version": "1.0",
   "tests": {
-    "total": 85,
-    "passed": 85,
+    "total": 108,
+    "passed": 108,
     "failed": 0,
     "skipped": 0
   },
   "coverage": {
-    "covered_statements": 338,
-    "total_statements": 366,
-    "percentage": 92.35,
+    "covered_statements": 345,
+    "total_statements": 372,
+    "percentage": 92.74,
     "threshold": 0
   },
   "packages": [
     {
       "name": ".",
       "status": "pass",
-      "tests": 54,
+      "tests": 76,
       "failed": 0,
-      "coverage": 91.16
+      "coverage": 91.71
     },
     {
       "name": "otelprop",
@@ -30,9 +30,9 @@
     {
       "name": "outbound",
       "status": "pass",
-      "tests": 23,
+      "tests": 24,
       "failed": 0,
-      "coverage": 93.79
+      "coverage": 93.96
     }
   ],
   "failures": null

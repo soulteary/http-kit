@@ -4,17 +4,17 @@
 
 | Metric | Value |
 | --- | --- |
-| Total | 85 |
-| Passed | 85 |
+| Total | 108 |
+| Passed | 108 |
 | Failed | 0 |
 | Skipped | 0 |
-| Coverage | 92.35% |
+| Coverage | 92.74% |
 | Threshold | 0.00% |
 
 ### Packages
 
 | Package | Status | Tests | Failed | Coverage |
 | --- | --- | --- | --- | --- |
-| . | pass | 54 | 0 | 91.16% |
+| . | pass | 76 | 0 | 91.71% |
 | otelprop | pass | 8 | 0 | 100.00% |
-| outbound | pass | 23 | 0 | 93.79% |
+| outbound | pass | 24 | 0 | 93.96% |
