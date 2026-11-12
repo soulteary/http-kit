@@ -42,7 +42,7 @@
 
 ## 环境要求
 
-- **Go 1.27.3+**（`go.mod` 声明 `go 1.27.3`）
+- **Go 1.27.4+**（`go.mod` 声明 `go 1.27.4`）
 - `go.opentelemetry.io/otel`，**仅当**你导入 `otelprop` 时需要
 
 ## 安装
