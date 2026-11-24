@@ -10,6 +10,10 @@ also changes the module path. The current one is
 
 ## [Unreleased]
 
+### Changed
+
+- Update `go.opentelemetry.io/auto/sdk` from v1.2.1 to v1.2.2.
+
 ## [2.1.1] — 2026-11-13
 
 ### Changed
